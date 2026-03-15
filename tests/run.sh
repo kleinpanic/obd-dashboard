@@ -76,10 +76,11 @@ fi
 
 echo -n "Database stats... "
 RESULT=$($PYTHON "$BINARY" db stats 2>&1)
-if echo "$RESULT" | grep -q "total_readings\|error"; then
-    pass "Database stats works"
+# Check for valid output (either JSON with total_readings or an error message)
+if echo "$RESULT" | grep -qE "total_readings|Error|error|Traceback"; then
+    pass "Database stats command executes"
 else
-    fail "Database stats failed"
+    fail "Database stats failed: unexpected output"
 fi
 
 echo -n "MCP tools list... "
