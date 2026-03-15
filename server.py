@@ -1670,21 +1670,7 @@ DASHBOARD_HTML = '''
                         </div>
                     </div>
                     
-                    <div class="section-title">Session Info</div>
-                    <div class="config-section">
-                        <div class="config-item">
-                            <div>
-                                <div class="config-label">Session ID</div>
-                                <div class="config-desc" id="session-id">--</div>
-                            </div>
-                        </div>
-                        <div class="config-item">
-                            <div>
-                                <div class="config-label">Session Start</div>
-                                <div class="config-desc" id="session-start">--</div>
-                            </div>
-                        </div>
-                    </div>
+
                 </div>
             </div>
         </div>
