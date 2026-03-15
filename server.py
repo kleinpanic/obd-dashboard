@@ -77,7 +77,14 @@ def init_db():
         )
     ''')
     
-    # Sessions table
+    # Sessions table - add vin column if missing
+    c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='sessions'")
+    if c.fetchone():
+        c.execute("PRAGMA table_info(sessions)")
+        columns = [col[1] for col in c.fetchall()]
+        if 'vin' not in columns:
+            c.execute("ALTER TABLE sessions ADD COLUMN vin TEXT")
+    
     c.execute('''
         CREATE TABLE IF NOT EXISTS sessions (
             id TEXT PRIMARY KEY,
@@ -384,12 +391,17 @@ class OBDManager:
                     vin_resp = self.connection.query(obd.commands.VIN)
                     if not vin_resp.is_null():
                         vin_val = vin_resp.value
-                        # Handle both string and bytes
-                        if isinstance(vin_val, bytes):
+                        # Handle different VIN formats from obd library
+                        if hasattr(vin_val, 'decode'):
                             current_vin = vin_val.decode('utf-8').strip()
+                        elif isinstance(vin_val, bytes):
+                            current_vin = vin_val.decode('utf-8').strip()
+                        elif 'bytearray' in str(type(vin_val)):
+                            current_vin = bytes(vin_val).decode('utf-8').strip()
                         else:
                             current_vin = str(vin_val).strip()
                         vehicle_profile = get_vehicle_profile(current_vin)
+                        print(f"VIN detected: {current_vin}")
                 except Exception as e:
                     print(f"VIN decode error: {e}")
                     pass
