@@ -7,9 +7,9 @@ Optimized for RPi4, offline-capable
 
 import asyncio
 import json
+import logging
 import sqlite3
 import time
-import os
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,6 +31,18 @@ DATA_DIR = Path.home() / ".local/share/obdc"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DATA_DIR / "obdc.db"
 CONFIG_PATH = DATA_DIR / "config.json"
+LOG_PATH = DATA_DIR / "obdc.log"
+
+# Logging setup
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_PATH),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("obdc")
 
 # Default config
 DEFAULT_CONFIG = {
@@ -56,7 +68,7 @@ config = load_config()
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    
+
     # Vehicle profiles table
     c.execute('''
         CREATE TABLE IF NOT EXISTS vehicle_profiles (
@@ -76,7 +88,7 @@ def init_db():
             updated_at REAL
         )
     ''')
-    
+
     # Sessions table - add vin column if missing
     c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='sessions'")
     if c.fetchone():
@@ -84,7 +96,7 @@ def init_db():
         columns = [col[1] for col in c.fetchall()]
         if 'vin' not in columns:
             c.execute("ALTER TABLE sessions ADD COLUMN vin TEXT")
-    
+
     c.execute('''
         CREATE TABLE IF NOT EXISTS sessions (
             id TEXT PRIMARY KEY,
@@ -98,7 +110,7 @@ def init_db():
             FOREIGN KEY (vin) REFERENCES vehicle_profiles(vin)
         )
     ''')
-    
+
     # Sensor data table (drop and recreate if schema changed)
     c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='sensor_data'")
     if c.fetchone():
@@ -106,7 +118,7 @@ def init_db():
         columns = [col[1] for col in c.fetchall()]
         if 'session_id' not in columns:
             c.execute("DROP TABLE sensor_data")
-    
+
     c.execute('''
         CREATE TABLE IF NOT EXISTS sensor_data (
             timestamp REAL,
@@ -117,11 +129,11 @@ def init_db():
             PRIMARY KEY (timestamp, sensor)
         )
     ''')
-    
+
     c.execute('CREATE INDEX IF NOT EXISTS idx_sensor ON sensor_data(sensor)')
     c.execute('CREATE INDEX IF NOT EXISTS idx_session ON sensor_data(session_id)')
     c.execute('CREATE INDEX IF NOT EXISTS idx_timestamp ON sensor_data(timestamp)')
-    
+
     # DTC table
     c.execute('''
         CREATE TABLE IF NOT EXISTS dtc_history (
@@ -131,7 +143,7 @@ def init_db():
             cleared INTEGER DEFAULT 0
         )
     ''')
-    
+
     # Vehicle stats cache
     c.execute('''
         CREATE TABLE IF NOT EXISTS vehicle_stats (
@@ -146,7 +158,7 @@ def init_db():
             last_session REAL
         )
     ''')
-    
+
     conn.commit()
     conn.close()
 
@@ -159,7 +171,7 @@ def get_vehicle_profile(vin):
     c = conn.cursor()
     c.execute("SELECT * FROM vehicle_profiles WHERE vin = ?", (vin,))
     row = c.fetchone()
-    
+
     if row:
         conn.close()
         return {
@@ -176,7 +188,7 @@ def get_vehicle_profile(vin):
             "low_fuel_warning": row[10],
             "low_fuel_danger": row[11],
         }
-    
+
     # Create new profile with defaults
     now = time.time()
     c.execute('''
@@ -185,7 +197,7 @@ def get_vehicle_profile(vin):
     ''', (vin, now, now))
     conn.commit()
     conn.close()
-    
+
     return {
         "vin": vin,
         "max_rpm": 8000,
@@ -202,18 +214,18 @@ def update_vehicle_profile(vin, **kwargs):
     """Update vehicle profile fields"""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    
+
     fields = []
     values = []
     for k, v in kwargs.items():
         fields.append(f"{k} = ?")
         values.append(v)
-    
+
     values.append(time.time())  # updated_at
     values.append(vin)
-    
+
     c.execute(f'''
-        UPDATE vehicle_profiles 
+        UPDATE vehicle_profiles
         SET {', '.join(fields)}, updated_at = ?
         WHERE vin = ?
     ''', values)
@@ -224,11 +236,11 @@ def get_vehicle_stats(vin):
     """Get aggregated stats for a vehicle"""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    
+
     # Get from cache
     c.execute("SELECT * FROM vehicle_stats WHERE vin = ?", (vin,))
     row = c.fetchone()
-    
+
     if row:
         conn.close()
         return {
@@ -241,10 +253,10 @@ def get_vehicle_stats(vin):
             "avg_speed": row[7],
             "last_session": row[8],
         }
-    
+
     # Calculate from sessions
     c.execute('''
-        SELECT 
+        SELECT
             COUNT(*),
             COALESCE(SUM(distance_km), 0),
             COALESCE(SUM(end_time - start_time), 0),
@@ -253,7 +265,7 @@ def get_vehicle_stats(vin):
         FROM sessions WHERE vin = ?
     ''', (vin,))
     row = c.fetchone()
-    
+
     stats = {
         "total_sessions": row[0],
         "total_distance_km": row[1],
@@ -263,7 +275,7 @@ def get_vehicle_stats(vin):
         "avg_rpm": 0,
         "avg_speed": 0,
     }
-    
+
     conn.close()
     return stats
 
@@ -271,14 +283,14 @@ def save_session_stats(session_id, vin, data):
     """Save aggregated session stats"""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    
+
     # Update session record
     c.execute('''
-        UPDATE sessions 
+        UPDATE sessions
         SET vin = ?, max_rpm = ?, max_speed = ?, end_time = ?
         WHERE id = ?
     ''', (vin, data.get('max_rpm', 0), data.get('max_speed', 0), time.time(), session_id))
-    
+
     # Update vehicle stats cache
     c.execute('''
         INSERT INTO vehicle_stats (vin, total_sessions, max_rpm_ever, max_speed_ever, last_session)
@@ -290,7 +302,7 @@ def save_session_stats(session_id, vin, data):
             last_session = ?
     ''', (vin, data.get('max_rpm', 0), data.get('max_speed', 0), time.time(),
           data.get('max_rpm', 0), data.get('max_speed', 0), time.time()))
-    
+
     conn.commit()
     conn.close()
 
@@ -300,21 +312,34 @@ current_vin = None
 vehicle_profile = None
 session_stats = {"max_rpm": 0, "max_speed": 0}
 
-def start_session():
-    global current_session_id, session_start_time
+# Engine state tracking
+engine_on = False
+engine_off_since = None
+ENGINE_OFF_TIMEOUT = 30  # seconds of RPM=0 before declaring engine off
+
+def start_session(reason="server_start"):
+    global current_session_id, session_start_time, session_stats
     current_session_id = str(uuid.uuid4())
     session_start_time = time.time()
-    
+    session_stats = {"max_rpm": 0, "max_speed": 0}
+
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("INSERT INTO sessions (id, start_time) VALUES (?, ?)", (current_session_id, session_start_time))
     conn.commit()
     conn.close()
+    logger.info(f"SESSION START [{reason}] id={current_session_id[:8]} vin={current_vin or 'unknown'}")
 
-def end_session():
-    global session_start_time, session_stats
+def end_session(reason="server_stop"):
+    global session_start_time
     if session_start_time:
+        duration = time.time() - session_start_time
         save_session_stats(current_session_id, current_vin, session_stats)
+        logger.info(
+            f"SESSION END [{reason}] id={current_session_id[:8]} "
+            f"duration={duration:.0f}s max_rpm={session_stats['max_rpm']} "
+            f"max_speed={session_stats['max_speed']}"
+        )
         session_start_time = None
 
 def log_sensor(sensor: str, value: float, unit: str):
@@ -346,10 +371,10 @@ def get_sessions(limit: int = 10):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute('''
-        SELECT id, start_time, end_time, distance_km, max_rpm, max_speed, avg_fuel 
-        FROM sessions 
-        WHERE end_time IS NOT NULL 
-        ORDER BY start_time DESC 
+        SELECT id, start_time, end_time, distance_km, max_rpm, max_speed, avg_fuel
+        FROM sessions
+        WHERE end_time IS NOT NULL
+        ORDER BY start_time DESC
         LIMIT ?
     ''', (limit,))
     rows = c.fetchall()
@@ -367,15 +392,15 @@ class OBDManager:
         self.last_data = {}
         self.last_sensor_data = {}
         self.dtc_codes = []
-        
+
     def connect(self):
         global current_vin, vehicle_profile
         if not OBD_AVAILABLE:
             return False
-        
+
         self.connecting = True
         ports = obd.scan_serial()
-        
+
         if not ports:
             self.connecting = False
             return False
@@ -386,7 +411,7 @@ class OBDManager:
                 self.connecting = False
                 self.supported = list(self.connection.supported_commands)
                 self.last_data = {}
-                
+
                 # Get VIN and load vehicle profile
                 try:
                     vin_resp = self.connection.query(obd.commands.VIN)
@@ -406,14 +431,14 @@ class OBDManager:
                 except Exception as e:
                     print(f"VIN decode error: {e}")
                     pass
-                
+
                 start_session()
                 return True
         except Exception as e:
             print(f"OBD connect error: {e}")
         self.connecting = False
         return False
-    
+
     def disconnect(self):
         if self.connection:
             try:
@@ -422,7 +447,7 @@ class OBDManager:
                 pass
             self.connected = False
             end_session()
-    
+
     def is_healthy(self):
         if not self.connection or not self.connected:
             return False
@@ -430,22 +455,21 @@ class OBDManager:
             return self.connection.is_connected()
         except:
             return False
-    
+
     def read_key_sensors(self):
-        global session_stats
         if not self.connected:
             return {}
-        
+
         if not self.is_healthy():
             self.disconnect()
             if not self.connect():
                 return {}
-        
-        key_pids = ['RPM', 'SPEED', 'INTAKE_TEMP', 'THROTTLE_POS', 
+
+        key_pids = ['RPM', 'SPEED', 'INTAKE_TEMP', 'THROTTLE_POS',
                     'FUEL_LEVEL', 'ENGINE_LOAD', 'MAF', 'TIMING_ADVANCE',
                     'CONTROL_MODULE_VOLTAGE', 'BAROMETRIC_PRESSURE', 'AMBIANT_AIR_TEMP',
                     'OIL_TEMP', 'FUEL_RATE', 'COMMANDED_EQUIV_RATIO']
-        
+
         data = {}
         with self.lock:
             for cmd in self.supported:
@@ -460,7 +484,7 @@ class OBDManager:
                                 data[cmd.name] = {"value": value, "unit": unit}
                                 log_sensor(cmd.name, value, unit)
                                 self.last_data[cmd.name] = data[cmd.name]
-                                
+
                                 # Track session maxes
                                 if cmd.name == 'RPM':
                                     session_stats['max_rpm'] = max(session_stats['max_rpm'], int(value))
@@ -468,15 +492,15 @@ class OBDManager:
                                     session_stats['max_speed'] = max(session_stats['max_speed'], int(value))
                     except Exception as e:
                         pass
-        
+
         for k, v in self.last_data.items():
             if k not in data:
                 data[k] = v
-        
+
         if data:
             self.last_sensor_data = data
         return data
-    
+
     def read_all(self):
         if not self.connected:
             return {}
@@ -494,7 +518,7 @@ class OBDManager:
                 except:
                     pass
         return data
-    
+
     def get_vin(self):
         if not self.connected:
             return None
@@ -505,7 +529,7 @@ class OBDManager:
         except:
             pass
         return None
-    
+
     def get_dtc(self):
         if not self.connected:
             return []
@@ -517,7 +541,7 @@ class OBDManager:
         except:
             pass
         return []
-    
+
     def clear_dtc(self):
         if not self.connected:
             return False
@@ -553,14 +577,37 @@ ws_manager = ConnectionManager()
 
 # Background OBD reader
 async def obd_reader():
+    global engine_on, engine_off_since
     consecutive_failures = 0
     connection_step = 0
-    
+
     while True:
         if obd_manager.connected and ws_manager.active_connections:
             try:
                 data = obd_manager.read_key_sensors()
                 if data:
+                    # --- Engine state detection ---
+                    rpm = data.get('RPM', {}).get('value', None)
+                    if rpm is not None:
+                        if rpm > 100:
+                            # Engine is running
+                            engine_off_since = None
+                            if not engine_on:
+                                engine_on = True
+                                start_session(reason="engine_on")
+                                logger.info(f"ENGINE ON rpm={rpm:.0f}")
+                        else:
+                            # RPM near 0 — may be engine off
+                            if engine_on:
+                                if engine_off_since is None:
+                                    engine_off_since = time.time()
+                                elif time.time() - engine_off_since >= ENGINE_OFF_TIMEOUT:
+                                    engine_on = False
+                                    engine_off_since = None
+                                    end_session(reason="engine_off")
+                                    logger.info("ENGINE OFF")
+                    # --- End engine state detection ---
+
                     await ws_manager.broadcast({
                         "type": "sensor_update",
                         "timestamp": time.time(),
@@ -573,6 +620,7 @@ async def obd_reader():
                 else:
                     consecutive_failures += 1
                     if consecutive_failures > 5:
+                        logger.warning("OBD connection lost after repeated failures, reconnecting...")
                         await ws_manager.broadcast({
                             "type": "connection_progress",
                             "step": 1,
@@ -584,17 +632,17 @@ async def obd_reader():
                         connection_step = 0
                         consecutive_failures = 0
             except Exception as e:
-                print(f"OBD reader error: {e}")
+                logger.error(f"OBD reader error: {e}")
                 consecutive_failures += 1
-                
+
         elif obd_manager.connecting and ws_manager.active_connections:
             # Already connecting, wait
             pass
-            
+
         elif not obd_manager.connected and ws_manager.active_connections:
             # Start connection with progress updates
             connection_step += 1
-            
+
             if connection_step == 1:
                 await ws_manager.broadcast({
                     "type": "connection_progress",
@@ -604,7 +652,7 @@ async def obd_reader():
                     "status": "info"
                 })
                 await asyncio.sleep(0.3)
-                
+
             elif connection_step == 2:
                 import obd as obd_module
                 ports = obd_module.scan_serial()
@@ -626,7 +674,7 @@ async def obd_reader():
                     })
                     connection_step = 0
                 await asyncio.sleep(0.3)
-                
+
             elif connection_step == 3:
                 await ws_manager.broadcast({
                     "type": "connection_progress",
@@ -636,7 +684,7 @@ async def obd_reader():
                     "status": "info"
                 })
                 await asyncio.sleep(0.3)
-                
+
             elif connection_step == 4:
                 await ws_manager.broadcast({
                     "type": "connection_progress",
@@ -647,6 +695,14 @@ async def obd_reader():
                 })
                 # Actually try to connect
                 if obd_manager.connect():
+                    try:
+                        proto = obd_manager.connection.protocol_name()
+                    except Exception:
+                        proto = "unknown"
+                    logger.info(
+                        f"OBD CONNECTED protocol={proto} "
+                        f"sensors={len(obd_manager.supported)} vin={current_vin or 'pending'}"
+                    )
                     await ws_manager.broadcast({
                         "type": "connection_progress",
                         "step": 5,
@@ -663,6 +719,7 @@ async def obd_reader():
                         "status": "success"
                     })
                 else:
+                    logger.warning("OBD connection attempt failed, retrying...")
                     await ws_manager.broadcast({
                         "type": "connection_progress",
                         "step": 4,
@@ -675,14 +732,18 @@ async def obd_reader():
                 await asyncio.sleep(0.3)
             else:
                 connection_step = 0
-        
+
         await asyncio.sleep(0.25)
 
 @asynccontextmanager
 async def lifespan(app):
+    logger.info("OBD Commander starting up")
+    start_session(reason="server_start")
     asyncio.create_task(obd_reader())
     yield
+    end_session(reason="server_stop")
     obd_manager.disconnect()
+    logger.info("OBD Commander shut down")
 
 app = FastAPI(title="OBD Commander", lifespan=lifespan)
 
@@ -708,10 +769,10 @@ async def status():
 async def get_vehicle():
     if not current_vin:
         return {"error": "No VIN detected"}
-    
+
     profile = get_vehicle_profile(current_vin)
     stats = get_vehicle_stats(current_vin)
-    
+
     return {
         "vin": current_vin,
         "profile": profile,
@@ -722,11 +783,11 @@ async def get_vehicle():
 async def update_vehicle(data: dict):
     if not current_vin:
         return {"error": "No VIN detected"}
-    
+
     update_vehicle_profile(current_vin, **data)
     global vehicle_profile
     vehicle_profile = get_vehicle_profile(current_vin)
-    
+
     return vehicle_profile
 
 @app.get("/api/sensors")
@@ -814,7 +875,7 @@ DASHBOARD_HTML = '''
             --danger: #ef4444;
             --blue: #3b82f6;
         }
-        
+
         [data-theme="light"] {
             --bg: #f5f5f5;
             --card: #fff;
@@ -822,21 +883,21 @@ DASHBOARD_HTML = '''
             --text: #000;
             --muted: #888;
         }
-        
-        html, body { 
-            height: 100%; 
+
+        html, body {
+            height: 100%;
             font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
             background: var(--bg);
             color: var(--text);
             overflow: hidden;
         }
-        
+
         .app {
             display: flex;
             flex-direction: column;
             height: 100%;
         }
-        
+
         /* Connection overlay */
         .connection-overlay {
             position: fixed;
@@ -849,9 +910,9 @@ DASHBOARD_HTML = '''
             z-index: 1000;
             padding: 20px;
         }
-        
+
         .connection-overlay.hidden { display: none; }
-        
+
         .spinner {
             width: 50px;
             height: 50px;
@@ -861,15 +922,15 @@ DASHBOARD_HTML = '''
             animation: spin 1s linear infinite;
             margin-bottom: 20px;
         }
-        
+
         @keyframes spin { to { transform: rotate(360deg); } }
-        
+
         .connection-text {
             font-size: 16px;
             color: var(--muted);
             margin-bottom: 20px;
         }
-        
+
         .progress-bar {
             width: 200px;
             height: 4px;
@@ -878,14 +939,14 @@ DASHBOARD_HTML = '''
             overflow: hidden;
             margin-bottom: 16px;
         }
-        
+
         .progress-fill {
             height: 100%;
             background: var(--accent);
             width: 0%;
             transition: width 0.3s ease;
         }
-        
+
         .connection-logs {
             width: 280px;
             max-height: 120px;
@@ -896,26 +957,26 @@ DASHBOARD_HTML = '''
             font-family: 'SF Mono', 'Monaco', monospace;
             font-size: 10px;
         }
-        
+
         .log-entry {
             color: var(--muted);
             padding: 2px 0;
             display: flex;
             gap: 6px;
         }
-        
+
         .log-entry .time {
             color: #666;
         }
-        
+
         .log-entry.success {
             color: var(--accent);
         }
-        
+
         .log-entry.error {
             color: var(--danger);
         }
-        
+
         /* Header */
         header {
             padding: 8px 16px;
@@ -925,9 +986,9 @@ DASHBOARD_HTML = '''
             border-bottom: 1px solid var(--border);
             flex-shrink: 0;
         }
-        
+
         .logo { font-weight: 700; font-size: 14px; }
-        
+
         .status {
             display: flex;
             align-items: center;
@@ -935,32 +996,32 @@ DASHBOARD_HTML = '''
             font-size: 12px;
             color: var(--muted);
         }
-        
+
         .status-dot {
             width: 6px;
             height: 6px;
             border-radius: 50%;
             background: var(--danger);
         }
-        
+
         .status-dot.connected { background: var(--accent); }
-        
+
         /* Pages */
         .page-container {
             flex: 1;
             overflow: hidden;
             position: relative;
         }
-        
+
         .page {
             position: absolute;
             top: 0; left: 0; right: 0; bottom: 0;
             display: none;
             overflow-y: auto;
         }
-        
+
         .page.active { display: block; }
-        
+
         /* Dashboard */
         .dashboard {
             padding: 16px;
@@ -968,13 +1029,13 @@ DASHBOARD_HTML = '''
             flex-direction: column;
             gap: 16px;
         }
-        
+
         .main-gauges {
             display: grid;
             grid-template-columns: 1fr 1fr;
             gap: 16px;
         }
-        
+
         .gauge-container {
             aspect-ratio: 1;
             position: relative;
@@ -986,26 +1047,26 @@ DASHBOARD_HTML = '''
             border-radius: 16px;
             overflow: hidden;
         }
-        
+
         .gauge-svg {
             position: absolute;
             width: 100%;
             height: 100%;
         }
-        
+
         .gauge-center {
             position: relative;
             text-align: center;
             z-index: 1;
         }
-        
+
         .gauge-value {
             font-size: 48px;
             font-weight: 200;
             font-variant-numeric: tabular-nums;
             line-height: 1;
         }
-        
+
         .gauge-unit { font-size: 12px; color: var(--muted); margin-top: 2px; }
         .gauge-label {
             position: absolute;
@@ -1016,12 +1077,12 @@ DASHBOARD_HTML = '''
             text-transform: uppercase;
             letter-spacing: 1px;
         }
-        
+
         /* Tooltips */
         [data-tooltip] {
             position: relative;
         }
-        
+
         [data-tooltip]:hover::after {
             content: attr(data-tooltip);
             position: absolute;
@@ -1037,17 +1098,17 @@ DASHBOARD_HTML = '''
             z-index: 100;
             color: var(--text);
         }
-        
+
         .stat[data-tooltip]:hover::after {
             margin-bottom: 4px;
         }
-        
+
         .stats-grid {
             display: grid;
             grid-template-columns: repeat(4, 1fr);
             gap: 8px;
         }
-        
+
         .stat {
             background: var(--card);
             border: 1px solid var(--border);
@@ -1055,33 +1116,33 @@ DASHBOARD_HTML = '''
             padding: 12px 8px;
             text-align: center;
         }
-        
+
         .stat-value {
             font-size: 20px;
             font-weight: 500;
             font-variant-numeric: tabular-nums;
             color: var(--accent);
         }
-        
+
         .stat-label {
             font-size: 10px;
             color: var(--muted);
             margin-top: 4px;
             text-transform: uppercase;
         }
-        
+
         .secondary-stats {
             display: grid;
             grid-template-columns: repeat(2, 1fr);
             gap: 8px;
         }
-        
+
         .stat-large {
             padding: 16px;
         }
-        
+
         .stat-large .stat-value { font-size: 28px; }
-        
+
         /* Sparkline graphs */
         .sparkline-container {
             display: grid;
@@ -1089,21 +1150,21 @@ DASHBOARD_HTML = '''
             gap: 8px;
             margin-bottom: 16px;
         }
-        
+
         .sparkline-card {
             background: var(--card);
             border: 1px solid var(--border);
             border-radius: 8px;
             padding: 8px;
         }
-        
+
         .sparkline-label {
             font-size: 10px;
             color: var(--muted);
             text-transform: uppercase;
             margin-bottom: 4px;
         }
-        
+
         .sparkline-canvas {
             height: 40px;
             width: 100%;
@@ -1115,7 +1176,7 @@ DASHBOARD_HTML = '''
             text-align: center;
             margin-top: 2px;
         }
-        
+
         /* Action buttons */
         .action-buttons {
             display: grid;
@@ -1123,7 +1184,7 @@ DASHBOARD_HTML = '''
             gap: 8px;
             margin-top: 8px;
         }
-        
+
         .action-btn {
             background: var(--card);
             border: 1px solid var(--border);
@@ -1138,13 +1199,13 @@ DASHBOARD_HTML = '''
             justify-content: center;
             gap: 8px;
         }
-        
+
         .action-btn:active { background: var(--border); }
         .action-btn.danger { border-color: var(--danger); color: var(--danger); }
-        
+
         /* Sensors page */
         .sensors-page { padding: 16px; }
-        
+
         .section-title {
             font-size: 11px;
             text-transform: uppercase;
@@ -1153,13 +1214,13 @@ DASHBOARD_HTML = '''
             margin-bottom: 12px;
             padding: 0 4px;
         }
-        
+
         .sensors-grid {
             display: grid;
             grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
             gap: 8px;
         }
-        
+
         .sensor-card {
             background: var(--card);
             border: 1px solid var(--border);
@@ -1167,9 +1228,9 @@ DASHBOARD_HTML = '''
             padding: 12px;
             cursor: pointer;
         }
-        
+
         .sensor-card:active { background: var(--border); }
-        
+
         .sensor-name {
             font-size: 10px;
             color: var(--muted);
@@ -1179,15 +1240,15 @@ DASHBOARD_HTML = '''
             text-overflow: ellipsis;
             white-space: nowrap;
         }
-        
+
         .sensor-value {
             font-size: 18px;
             font-weight: 500;
             font-variant-numeric: tabular-nums;
         }
-        
+
         .sensor-unit { font-size: 10px; color: var(--muted); margin-left: 2px; }
-        
+
         /* Sensor detail modal */
         .modal {
             position: fixed;
@@ -1199,9 +1260,9 @@ DASHBOARD_HTML = '''
             z-index: 100;
             padding: 16px;
         }
-        
+
         .modal.active { display: flex; }
-        
+
         .modal-content {
             background: var(--card);
             border: 1px solid var(--border);
@@ -1211,7 +1272,7 @@ DASHBOARD_HTML = '''
             max-height: 80vh;
             overflow-y: auto;
         }
-        
+
         .modal-header {
             padding: 16px;
             border-bottom: 1px solid var(--border);
@@ -1219,7 +1280,7 @@ DASHBOARD_HTML = '''
             justify-content: space-between;
             align-items: center;
         }
-        
+
         .modal-title { font-size: 16px; font-weight: 600; }
         .modal-close {
             background: none;
@@ -1228,34 +1289,34 @@ DASHBOARD_HTML = '''
             font-size: 24px;
             cursor: pointer;
         }
-        
+
         .modal-body { padding: 16px; }
-        
+
         .modal-chart {
             height: 150px;
             background: var(--bg);
             border-radius: 8px;
             margin-bottom: 16px;
         }
-        
+
         .modal-chart canvas { width: 100%; height: 100%; }
-        
+
         .modal-stats {
             display: grid;
             grid-template-columns: repeat(2, 1fr);
             gap: 8px;
         }
-        
+
         .modal-stat {
             background: var(--bg);
             border-radius: 8px;
             padding: 12px;
             text-align: center;
         }
-        
+
         /* History page */
         .history-page { padding: 16px; }
-        
+
         .chart-container {
             background: var(--card);
             border: 1px solid var(--border);
@@ -1263,16 +1324,16 @@ DASHBOARD_HTML = '''
             padding: 16px;
             margin-bottom: 16px;
         }
-        
+
         .chart-title {
             font-size: 12px;
             color: var(--muted);
             margin-bottom: 12px;
         }
-        
+
         .chart { height: 120px; }
         .chart canvas { width: 100%; height: 100%; }
-        
+
         .history-stats {
             display: grid;
             grid-template-columns: repeat(4, 1fr);
@@ -1281,21 +1342,21 @@ DASHBOARD_HTML = '''
             padding-top: 12px;
             border-top: 1px solid var(--border);
         }
-        
+
         .history-stat { text-align: center; }
         .history-stat-value { font-size: 16px; font-weight: 500; color: var(--accent); }
         .history-stat-label { font-size: 10px; color: var(--muted); text-transform: uppercase; }
-        
+
         /* Config page */
         .config-page { padding: 16px; }
-        
+
         .config-section {
             background: var(--card);
             border: 1px solid var(--border);
             border-radius: 12px;
             margin-bottom: 12px;
         }
-        
+
         .config-item {
             padding: 16px;
             display: flex;
@@ -1303,12 +1364,12 @@ DASHBOARD_HTML = '''
             align-items: center;
             border-bottom: 1px solid var(--border);
         }
-        
+
         .config-item:last-child { border-bottom: none; }
-        
+
         .config-label { font-size: 14px; }
         .config-desc { font-size: 11px; color: var(--muted); margin-top: 2px; }
-        
+
         .toggle {
             width: 50px;
             height: 28px;
@@ -1317,9 +1378,9 @@ DASHBOARD_HTML = '''
             position: relative;
             cursor: pointer;
         }
-        
+
         .toggle.active { background: var(--accent); }
-        
+
         .toggle::after {
             content: '';
             position: absolute;
@@ -1331,38 +1392,38 @@ DASHBOARD_HTML = '''
             left: 2px;
             transition: left 0.2s;
         }
-        
+
         .toggle.active::after { left: 24px; }
-        
+
         /* DTC modal */
         .dtc-list { margin: 16px 0; }
-        
+
         .dtc-item {
             background: var(--bg);
             border-radius: 8px;
             padding: 12px;
             margin-bottom: 8px;
         }
-        
+
         .dtc-code { font-weight: 600; color: var(--warning); }
         .dtc-desc { font-size: 12px; color: var(--muted); margin-top: 4px; }
-        
+
         .no-dtc { text-align: center; color: var(--accent); padding: 20px; }
-        
+
         /* Confirm modal */
         .confirm-text {
             text-align: center;
             padding: 20px;
             color: var(--muted);
         }
-        
+
         .confirm-buttons {
             display: grid;
             grid-template-columns: 1fr 1fr;
             gap: 8px;
             padding: 16px;
         }
-        
+
         .confirm-btn {
             padding: 12px;
             border-radius: 8px;
@@ -1370,24 +1431,24 @@ DASHBOARD_HTML = '''
             font-weight: 500;
             cursor: pointer;
         }
-        
+
         .confirm-btn.cancel {
             background: var(--border);
             color: var(--text);
         }
-        
+
         .confirm-btn.confirm {
             background: var(--danger);
             color: #fff;
         }
-        
+
         /* Nav */
         nav {
             display: flex;
             border-top: 1px solid var(--border);
             flex-shrink: 0;
         }
-        
+
         nav button {
             flex: 1;
             background: none;
@@ -1403,10 +1464,10 @@ DASHBOARD_HTML = '''
             align-items: center;
             gap: 4px;
         }
-        
+
         nav button.active { color: var(--accent); }
         nav button svg { width: 20px; height: 20px; }
-        
+
         .warning { color: var(--warning); }
         .danger { color: var(--danger); }
     </style>
@@ -1421,7 +1482,7 @@ DASHBOARD_HTML = '''
         </div>
         <div class="connection-logs" id="connection-logs"></div>
     </div>
-    
+
     <div class="app">
         <header>
             <div class="logo">OBD Commander</div>
@@ -1430,7 +1491,7 @@ DASHBOARD_HTML = '''
                 <span id="status-text">Connecting</span>
             </div>
         </header>
-        
+
         <div class="page-container">
             <!-- Dashboard Page -->
             <div class="page active" id="page-dashboard">
@@ -1453,7 +1514,7 @@ DASHBOARD_HTML = '''
                             <div class="gauge-label">Speed</div>
                         </div>
                     </div>
-                    
+
                     <!-- Mini Sparkline Graphs -->
                     <div class="sparkline-container">
                         <div class="sparkline-card">
@@ -1477,7 +1538,7 @@ DASHBOARD_HTML = '''
                             <div class="sparkline-value" id="spark-throttle-val">--</div>
                         </div>
                     </div>
-                    
+
                     <div class="stats-grid">
                         <div class="stat" data-tooltip="Air temperature entering the engine">
                             <div class="stat-value" id="intake-value">--</div>
@@ -1496,7 +1557,7 @@ DASHBOARD_HTML = '''
                             <div class="stat-label">Timing °</div>
                         </div>
                     </div>
-                    
+
                     <div class="secondary-stats">
                         <div class="stat stat-large" data-tooltip="Remaining fuel in tank">
                             <div class="stat-value" id="fuel-value">--</div>
@@ -1515,7 +1576,7 @@ DASHBOARD_HTML = '''
                             <div class="stat-label" id="oil-label">Oil °C</div>
                         </div>
                     </div>
-                    
+
                     <div class="action-buttons">
                         <button class="action-btn" onclick="showDTC()">
                             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -1535,7 +1596,7 @@ DASHBOARD_HTML = '''
                     </div>
                 </div>
             </div>
-            
+
             <!-- Sensors Page -->
             <div class="page" id="page-sensors">
                 <div class="sensors-page">
@@ -1543,7 +1604,7 @@ DASHBOARD_HTML = '''
                     <div class="sensors-grid" id="sensors-grid"></div>
                 </div>
             </div>
-            
+
             <!-- History Page -->
             <div class="page" id="page-history">
                 <div class="history-page">
@@ -1569,7 +1630,7 @@ DASHBOARD_HTML = '''
                     </div>
                 </div>
             </div>
-            
+
             <!-- Config Page -->
             <div class="page" id="page-config">
                 <div class="config-page">
@@ -1594,7 +1655,7 @@ DASHBOARD_HTML = '''
                             </div>
                         </div>
                     </div>
-                    
+
                     <div class="section-title">Vehicle Stats (All Time)</div>
                     <div class="config-section">
                         <div class="config-item">
@@ -1622,7 +1683,7 @@ DASHBOARD_HTML = '''
                             </div>
                         </div>
                     </div>
-                    
+
                     <div class="section-title">Session</div>
                     <div class="config-section">
                         <div class="config-item">
@@ -1650,9 +1711,9 @@ DASHBOARD_HTML = '''
                             </div>
                         </div>
                     </div>
-                    
+
                     <div class="section-title">Settings</div>
-                    
+
                     <div class="config-section">
                         <div class="config-item">
                             <div>
@@ -1669,12 +1730,12 @@ DASHBOARD_HTML = '''
                             <div class="toggle active" id="units-toggle" onclick="toggleUnits()"></div>
                         </div>
                     </div>
-                    
+
 
                 </div>
             </div>
         </div>
-        
+
         <nav>
             <button class="active" onclick="showPage('dashboard', this)">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -1708,7 +1769,7 @@ DASHBOARD_HTML = '''
             </button>
         </nav>
     </div>
-    
+
     <!-- Sensor Detail Modal -->
     <div class="modal" id="sensor-modal">
         <div class="modal-content">
@@ -1722,7 +1783,7 @@ DASHBOARD_HTML = '''
             </div>
         </div>
     </div>
-    
+
     <!-- DTC Modal -->
     <div class="modal" id="dtc-modal">
         <div class="modal-content">
@@ -1735,7 +1796,7 @@ DASHBOARD_HTML = '''
             </div>
         </div>
     </div>
-    
+
     <!-- Confirm Modal -->
     <div class="modal" id="confirm-modal">
         <div class="modal-content">
@@ -1752,7 +1813,7 @@ DASHBOARD_HTML = '''
             </div>
         </div>
     </div>
-    
+
     <script>
         const data = {};
         let config = { theme: 'dark', units: 'metric' };
@@ -1760,7 +1821,7 @@ DASHBOARD_HTML = '''
         let sessionMax = { rpm: 0, speed: 0 };
         let ws;
         let isConnected = false;
-        
+
         // Sparkline data buffers (keep last 60 points = 15 seconds at 4Hz)
         const sparklineData = {
             RPM: [],
@@ -1769,7 +1830,7 @@ DASHBOARD_HTML = '''
             THROTTLE_POS: []
         };
         const SPARKLINE_MAX = 60;
-        
+
         // Load config
         fetch('/api/config')
             .then(r => r.json())
@@ -1781,57 +1842,57 @@ DASHBOARD_HTML = '''
                 // Use defaults if fetch fails
                 console.log('Using default config');
             });
-        
+
         function applyConfig() {
             document.body.dataset.theme = config.theme;
             document.getElementById('theme-toggle').classList.toggle('active', config.theme === 'dark');
             document.getElementById('units-toggle').classList.toggle('active', config.units === 'metric');
         }
-        
+
         function toggleTheme() {
             config.theme = config.theme === 'dark' ? 'light' : 'dark';
             applyConfig();
             fetch('/api/config', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(config) });
         }
-        
+
         function toggleUnits() {
             config.units = config.units === 'metric' ? 'imperial' : 'metric';
             applyConfig();
             fetch('/api/config', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(config) });
             updateUI();
         }
-        
+
         // Convert units
         function convertSpeed(kmh) {
             return config.units === 'metric' ? kmh : kmh * 0.621371;
         }
-        
+
         function convertTemp(c) {
             return config.units === 'metric' ? c : c * 9/5 + 32;
         }
-        
+
         // Gauge drawing
         function drawGauge(svgId, value, max, color = '#22c55e') {
             const svg = document.getElementById(svgId);
             if (!svg) return;
-            
+
             const percent = Math.min(Math.max(value / max, 0), 1);
             const startAngle = -135;
             const endAngle = startAngle + (270 * percent);
             const cx = 100, cy = 100, r = 75;
-            
+
             // Create background arc (full)
             const bgPath = describeArc(cx, cy, r, -135, 135);
-            
+
             // Create value arc
             const valPath = describeArc(cx, cy, r, -135, endAngle);
-            
+
             svg.innerHTML = `
                 <path d="${bgPath}" fill="none" stroke="#1a1a1a" stroke-width="10" stroke-linecap="round"/>
                 <path d="${valPath}" fill="none" stroke="${color}" stroke-width="10" stroke-linecap="round"/>
             `;
         }
-        
+
         function describeArc(x, y, radius, startAngle, endAngle) {
             const start = polarToCartesian(x, y, radius, endAngle);
             const end = polarToCartesian(x, y, radius, startAngle);
@@ -1841,31 +1902,31 @@ DASHBOARD_HTML = '''
                 "A", radius, radius, 0, largeArcFlag, 0, end.x, end.y
             ].join(" ");
         }
-        
+
         function polarToCartesian(cx, cy, r, angle) {
             const rad = (angle - 90) * Math.PI / 180;
             return { x: cx + r * Math.cos(rad), y: cy + r * Math.sin(rad) };
         }
-        
+
         // Sparkline drawing
         function drawSparkline(canvasId, values, color = '#22c55e') {
             const canvas = document.getElementById(canvasId);
             if (!canvas || values.length < 2) return;
-            
+
             const ctx = canvas.getContext('2d');
             const rect = canvas.getBoundingClientRect();
             canvas.width = rect.width * 2;
             canvas.height = rect.height * 2;
             ctx.scale(2, 2);
-            
+
             const w = rect.width;
             const h = rect.height;
             const padding = 2;
-            
+
             const max = Math.max(...values, 1);
             const min = Math.min(...values, 0);
             const range = max - min || 1;
-            
+
             ctx.beginPath();
             values.forEach((v, i) => {
                 const x = padding + (i / (values.length - 1)) * (w - padding * 2);
@@ -1877,7 +1938,7 @@ DASHBOARD_HTML = '''
             ctx.lineWidth = 1.5;
             ctx.stroke();
         }
-        
+
         function updateSparklines() {
             drawSparkline('rpm-sparkline', sparklineData.RPM, '#22c55e');
             drawSparkline('speed-sparkline', sparklineData.SPEED, '#3b82f6');
@@ -1892,31 +1953,31 @@ DASHBOARD_HTML = '''
             if (ld.length) document.getElementById('spark-load-val').textContent = Math.round(ld[ld.length-1]) + '%';
             if (th.length) document.getElementById('spark-throttle-val').textContent = Math.round(th[th.length-1]) + '%';
         }
-        
+
         // Chart drawing
         function drawChart(canvasId, points, color = '#22c55e') {
             const canvas = document.getElementById(canvasId);
             if (!canvas) return;
-            
+
             const ctx = canvas.getContext('2d');
             const rect = canvas.getBoundingClientRect();
             canvas.width = rect.width * 2;
             canvas.height = rect.height * 2;
             ctx.scale(2, 2);
-            
+
             if (!points || points.length < 2) {
                 ctx.fillStyle = '#666';
                 ctx.font = '12px system-ui';
                 ctx.fillText('No data', 10, rect.height / 2);
                 return;
             }
-            
+
             const w = rect.width, h = rect.height, padding = 8;
             const vals = points.map(p => p.v);
             const max = Math.max(...vals, 1);
             const min = Math.min(...vals, 0);
             const range = max - min || 1;
-            
+
             ctx.beginPath();
             points.forEach((p, i) => {
                 const x = padding + (i / (points.length - 1)) * (w - padding * 2);
@@ -1927,60 +1988,60 @@ DASHBOARD_HTML = '''
             ctx.strokeStyle = color;
             ctx.lineWidth = 2;
             ctx.stroke();
-            
+
             ctx.lineTo(w - padding, h - padding);
             ctx.lineTo(padding, h - padding);
             ctx.closePath();
             ctx.fillStyle = color + '20';
             ctx.fill();
         }
-        
+
         // Update UI
         function updateUI() {
             const unitC = config.units === 'metric' ? '°C' : '°F';
-            
+
             const rpm = data.RPM?.value || 0;
             const rpmEl = document.getElementById('rpm-value');
             rpmEl.textContent = Math.round(rpm).toLocaleString();
-            
+
             // Color based on vehicle redline
             const rpmColor = rpm > vehicle.redline_rpm ? '#ef4444' : rpm > vehicle.redline_rpm * 0.9 ? '#f59e0b' : '#22c55e';
             rpmEl.className = 'gauge-value' + (rpm > vehicle.redline_rpm ? ' danger' : rpm > vehicle.redline_rpm * 0.9 ? ' warning' : '');
             drawGauge('rpm-gauge', rpm, vehicle.max_rpm, rpmColor);
-            
+
             const speedKmh = data.SPEED?.value || 0;
             const speed = convertSpeed(speedKmh);
             document.getElementById('speed-value').textContent = Math.round(speed);
             document.getElementById('speed-unit').textContent = config.units === 'metric' ? 'km/h' : 'mph';
             drawGauge('speed-gauge', speed, config.units === 'metric' ? vehicle.max_speed : vehicle.max_speed * 0.621, '#3b82f6');
-            
+
             const format = (v, u) => v !== undefined ? `${Math.round(v)}${u}` : '--';
-            
+
             const intakeTemp = data.INTAKE_TEMP?.value;
             document.getElementById('intake-value').textContent = format(convertTemp(intakeTemp), '');
             document.getElementById('intake-label').textContent = `Intake ${unitC}`;
-            
+
             // Engine load color
             const load = data.ENGINE_LOAD?.value || 0;
             const loadEl = document.getElementById('load-value');
             loadEl.textContent = format(load, '%');
             loadEl.className = 'stat-value' + (load > 90 ? ' danger' : load > 75 ? ' warning' : '');
-            
+
             document.getElementById('throttle-value').textContent = format(data.THROTTLE_POS?.value, '%');
             document.getElementById('timing-value').textContent = format(data.TIMING_ADVANCE?.value, '°');
-            
+
             const fuel = data.FUEL_LEVEL?.value;
             const fuelEl = document.getElementById('fuel-value');
             fuelEl.textContent = format(fuel, '%');
             fuelEl.className = 'stat-value' + (fuel < vehicle.low_fuel_danger ? ' danger' : fuel < vehicle.low_fuel_warning ? ' warning' : '');
-            
+
             document.getElementById('maf-value').textContent = data.MAF?.value ? `${data.MAF.value.toFixed(1)}` : '--';
             document.getElementById('voltage-value').textContent = data.CONTROL_MODULE_VOLTAGE?.value ? `${data.CONTROL_MODULE_VOLTAGE.value.toFixed(1)}` : '--';
-            
+
             const oilTemp = data.OIL_TEMP?.value;
             document.getElementById('oil-value').textContent = oilTemp ? Math.round(convertTemp(oilTemp)) : '--';
             document.getElementById('oil-label').textContent = `Oil ${unitC}`;
-            
+
             // Update sparkline buffers
             if (rpm > 0) {
                 sparklineData.RPM.push(rpm);
@@ -1999,9 +2060,9 @@ DASHBOARD_HTML = '''
                 sparklineData.THROTTLE_POS.push(throttle);
                 if (sparklineData.THROTTLE_POS.length > SPARKLINE_MAX) sparklineData.THROTTLE_POS.shift();
             }
-            
+
             updateSparklines();
-            
+
             // Sensors list
             const grid = document.getElementById('sensors-grid');
             grid.innerHTML = Object.entries(data)
@@ -2013,7 +2074,7 @@ DASHBOARD_HTML = '''
                     </div>
                 `).join('');
         }
-        
+
         function updateVehicleUI() {
             fetch('/api/vehicle').then(r => r.json()).then(v => {
                 if (v.profile) {
@@ -2031,7 +2092,7 @@ DASHBOARD_HTML = '''
                 }
             }).catch(() => {});
         }
-        
+
         function getSensorDescription(name) {
             const descriptions = {
                 'INTAKE_TEMP': 'Temperature of air entering engine',
@@ -2048,23 +2109,23 @@ DASHBOARD_HTML = '''
             };
             return descriptions[name] || 'Vehicle sensor data';
         }
-        
+
         // Sensor detail modal
         async function showSensorDetail(sensor) {
             document.getElementById('sensor-modal-title').textContent = sensor.replace(/_/g, ' ');
             document.getElementById('sensor-modal').classList.add('active');
-            
+
             try {
                 const history = await fetch(`/api/history/${sensor}?minutes=30`).then(r => r.json());
                 drawChart('sensor-chart', history, '#22c55e');
-                
+
                 if (history && history.length > 0) {
                     const values = history.map(p => p.v);
                     const min = Math.min(...values);
                     const max = Math.max(...values);
                     const avg = values.reduce((a, b) => a + b, 0) / values.length;
                     const current = values[values.length - 1];
-                    
+
                     document.getElementById('sensor-modal-stats').innerHTML = `
                         <div class="modal-stat">
                             <div class="history-stat-value">${current.toFixed(1)}</div>
@@ -2088,19 +2149,19 @@ DASHBOARD_HTML = '''
                 console.error(e);
             }
         }
-        
+
         function closeSensorModal() {
             document.getElementById('sensor-modal').classList.remove('active');
         }
-        
+
         // DTC
         async function showDTC() {
             document.getElementById('dtc-modal').classList.add('active');
-            
+
             try {
                 const result = await fetch('/api/dtc').then(r => r.json());
                 const list = document.getElementById('dtc-list');
-                
+
                 if (result.dtc && result.dtc.length > 0) {
                     list.innerHTML = result.dtc.map(([code, desc]) => `
                         <div class="dtc-item">
@@ -2115,19 +2176,19 @@ DASHBOARD_HTML = '''
                 console.error(e);
             }
         }
-        
+
         function closeDTCModal() {
             document.getElementById('dtc-modal').classList.remove('active');
         }
-        
+
         function confirmClearDTC() {
             document.getElementById('confirm-modal').classList.add('active');
         }
-        
+
         function closeConfirmModal() {
             document.getElementById('confirm-modal').classList.remove('active');
         }
-        
+
         async function clearDTC() {
             try {
                 await fetch('/api/dtc/clear', { method: 'POST' });
@@ -2137,17 +2198,17 @@ DASHBOARD_HTML = '''
                 console.error(e);
             }
         }
-        
+
         // History stats
         function renderHistoryStats(containerId, points, unit = '') {
             if (!points || points.length < 2) return '';
-            
+
             const values = points.map(p => p.v);
             const min = Math.min(...values);
             const max = Math.max(...values);
             const avg = values.reduce((a, b) => a + b, 0) / values.length;
             const current = values[values.length - 1];
-            
+
             const container = document.getElementById(containerId);
             if (container) {
                 container.innerHTML = `
@@ -2170,7 +2231,7 @@ DASHBOARD_HTML = '''
                 `;
             }
         }
-        
+
         async function fetchHistory() {
             try {
                 const [speed, rpm, load, fuel] = await Promise.all([
@@ -2179,12 +2240,12 @@ DASHBOARD_HTML = '''
                     fetch('/api/history/ENGINE_LOAD?minutes=5').then(r => r.json()),
                     fetch('/api/history/FUEL_LEVEL?minutes=5').then(r => r.json()),
                 ]);
-                
+
                 drawChart('speed-chart', speed, '#3b82f6');
                 drawChart('rpm-chart', rpm, '#22c55e');
                 drawChart('load-chart', load, '#f59e0b');
                 drawChart('fuel-chart', fuel, '#22c55e');
-                
+
                 renderHistoryStats('speed-stats', speed, config.units === 'metric' ? ' km/h' : ' mph');
                 renderHistoryStats('rpm-stats', rpm, ' RPM');
                 renderHistoryStats('load-stats', load, '%');
@@ -2193,7 +2254,7 @@ DASHBOARD_HTML = '''
                 console.error('Failed to fetch history', e);
             }
         }
-        
+
         // Page navigation
         function showPage(page, btnElement) {
             document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
@@ -2202,39 +2263,39 @@ DASHBOARD_HTML = '''
             if (btnElement) {
                 btnElement.classList.add('active');
             }
-            
+
             if (page === 'history') fetchHistory();
             if (page === 'config') updateSessionInfo();
         }
-        
+
         async function updateSessionInfo() {
             try {
                 const status = await fetch('/api/status').then(r => r.json());
                 document.getElementById('session-id').textContent = status.session_id?.substring(0, 8) || '--';
-                document.getElementById('session-start').textContent = status.session_start 
-                    ? new Date(status.session_start * 1000).toLocaleTimeString() 
+                document.getElementById('session-start').textContent = status.session_start
+                    ? new Date(status.session_start * 1000).toLocaleTimeString()
                     : '--';
                 document.getElementById('session-maxrpm').textContent = status.session_max_rpm || 0;
                 document.getElementById('session-maxspeed').textContent = `${status.session_max_speed || 0} km/h`;
-                
+
                 // Also update vehicle info
                 updateVehicleUI();
             } catch(e) {}
         }
-        
+
         // WebSocket connection
         let connectionLogs = [];
-        
+
         function addLog(message, status = 'info') {
             const now = new Date();
             const time = now.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
             connectionLogs.push({ time, message, status });
-            
+
             // Keep last 10 logs
             if (connectionLogs.length > 10) {
                 connectionLogs.shift();
             }
-            
+
             const logsEl = document.getElementById('connection-logs');
             if (logsEl) {
                 logsEl.innerHTML = connectionLogs.map(log => `
@@ -2246,23 +2307,23 @@ DASHBOARD_HTML = '''
                 logsEl.scrollTop = logsEl.scrollHeight;
             }
         }
-        
+
         function connect() {
             const wsUrl = `ws://${location.host}/ws`;
             console.log('Connecting to', wsUrl);
-            
+
             addLog('Starting connection...', 'info');
-            
+
             try {
                 ws = new WebSocket(wsUrl);
-                
+
                 ws.onopen = () => {
                     console.log('WebSocket connected');
                     isConnected = true;
                     document.getElementById('status-dot').classList.add('connected');
                     document.getElementById('status-text').textContent = 'Connected';
                 };
-                
+
                 ws.onclose = () => {
                     console.log('WebSocket disconnected');
                     isConnected = false;
@@ -2272,15 +2333,15 @@ DASHBOARD_HTML = '''
                     connectionLogs = [];
                     setTimeout(connect, 2000);
                 };
-                
+
                 ws.onerror = (e) => {
                     console.error('WebSocket error:', e);
                     addLog('WebSocket error', 'error');
                 };
-                
+
                 ws.onmessage = (event) => {
                     const msg = JSON.parse(event.data);
-                    
+
                     if (msg.type === 'sensor_update') {
                         Object.assign(data, msg.data);
                         if (msg.vehicle) {
@@ -2290,7 +2351,7 @@ DASHBOARD_HTML = '''
                             sessionMax = msg.session_stats;
                         }
                         updateUI();
-                        
+
                         if (document.getElementById('connection-overlay').classList.contains('hidden') === false) {
                             document.getElementById('connection-overlay').classList.add('hidden');
                         }
@@ -2298,10 +2359,10 @@ DASHBOARD_HTML = '''
                         // Update progress bar
                         const progress = msg.progress || 0;
                         document.getElementById('progress-fill').style.width = progress + '%';
-                        
+
                         // Update text
                         document.getElementById('connection-text').textContent = msg.message;
-                        
+
                         // Add log
                         addLog(msg.message, msg.status || 'info');
                     }
@@ -2312,13 +2373,13 @@ DASHBOARD_HTML = '''
                 setTimeout(connect, 2000);
             }
         }
-        
+
         // Initial fetch
         fetch('/api/sensors')
             .then(r => r.json())
             .then(d => { Object.assign(data, d); updateUI(); })
             .catch(console.error);
-        
+
         connect();
     </script>
 </body>
@@ -2327,15 +2388,15 @@ DASHBOARD_HTML = '''
 
 if __name__ == "__main__":
     import argparse
-    
+
     parser = argparse.ArgumentParser(description="OBD Commander Car Computer")
     parser.add_argument("--port", "-p", type=int, default=9000)
     parser.add_argument("--host", default="0.0.0.0")
     args = parser.parse_args()
-    
+
     print("OBD Commander - Car Computer")
     print("=" * 40)
-    
+
     if OBD_AVAILABLE:
         print("Connecting to OBD...")
         if obd_manager.connect():
@@ -2344,8 +2405,8 @@ if __name__ == "__main__":
             print("✗ No OBD connection - will retry...")
     else:
         print("✗ OBD library not installed")
-    
+
     print(f"\nDashboard: http://{args.host}:{args.port}")
     print("Press Ctrl+C to stop\n")
-    
+
     uvicorn.run(app, host=args.host, port=args.port, log_level="error")
