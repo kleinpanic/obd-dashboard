@@ -365,9 +365,12 @@ DASHBOARD_HTML = '''
             display: flex;
             align-items: center;
             justify-content: center;
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 16px;
         }
         
-        .gauge-canvas {
+        .gauge-svg {
             position: absolute;
             width: 100%;
             height: 100%;
@@ -394,7 +397,7 @@ DASHBOARD_HTML = '''
         
         .gauge-label {
             position: absolute;
-            bottom: 8px;
+            bottom: 12px;
             left: 0;
             right: 0;
             text-align: center;
@@ -582,7 +585,7 @@ DASHBOARD_HTML = '''
                 <div class="dashboard">
                     <div class="main-gauges">
                         <div class="gauge-container">
-                            <canvas class="gauge-canvas" id="rpm-gauge"></canvas>
+                            <svg class="gauge-svg" viewBox="0 0 200 200" id="rpm-gauge"></svg>
                             <div class="gauge-center">
                                 <div class="gauge-value" id="rpm-value">0</div>
                                 <div class="gauge-unit">RPM</div>
@@ -590,7 +593,7 @@ DASHBOARD_HTML = '''
                             <div class="gauge-label">Engine Speed</div>
                         </div>
                         <div class="gauge-container">
-                            <canvas class="gauge-canvas" id="speed-gauge"></canvas>
+                            <svg class="gauge-svg" viewBox="0 0 200 200" id="speed-gauge"></svg>
                             <div class="gauge-center">
                                 <div class="gauge-value" id="speed-value">0</div>
                                 <div class="gauge-unit">km/h</div>
@@ -689,74 +692,87 @@ DASHBOARD_HTML = '''
         const data = {};
         let ws;
         
-        // Gauge drawing
-        function drawGauge(canvas, value, max, color = '#22c55e') {
-            const ctx = canvas.getContext('2d');
-            const rect = canvas.getBoundingClientRect();
-            canvas.width = rect.width * 2;
-            canvas.height = rect.height * 2;
-            ctx.scale(2, 2);
+        // Gauge drawing with SVG
+        function drawGauge(svgId, value, max, color = '#22c55e') {
+            const svg = document.getElementById(svgId);
+            if (!svg) return;
             
-            const cx = rect.width / 2;
-            const cy = rect.height / 2;
-            const radius = Math.min(cx, cy) - 10;
+            const percent = Math.min(value / max, 1);
+            const startAngle = -135;
+            const endAngle = startAngle + (270 * percent);
             
-            // Background arc
-            ctx.beginPath();
-            ctx.arc(cx, cy, radius, Math.PI * 0.75, Math.PI * 2.25);
-            ctx.strokeStyle = '#1a1a1a';
-            ctx.lineWidth = 8;
-            ctx.lineCap = 'round';
-            ctx.stroke();
+            // Calculate arc path
+            const cx = 100, cy = 100, r = 80;
+            const start = polarToCartesian(cx, cy, r, endAngle);
+            const end = polarToCartesian(cx, cy, r, startAngle);
+            const largeArc = percent > 0.5 ? 1 : 0;
             
-            // Value arc
-            const angle = Math.PI * 0.75 + (Math.PI * 1.5 * Math.min(value / max, 1));
-            ctx.beginPath();
-            ctx.arc(cx, cy, radius, Math.PI * 0.75, angle);
-            ctx.strokeStyle = color;
-            ctx.lineWidth = 8;
-            ctx.lineCap = 'round';
-            ctx.stroke();
+            const path = `M ${start.x} ${start.y} A ${r} ${r} 0 ${largeArc} 0 ${end.x} ${end.y}`;
+            
+            svg.innerHTML = `
+                <path d="M ${polarToCartesian(cx,cy,r,-135).x} ${polarToCartesian(cx,cy,r,-135).y} A ${r} ${r} 0 1 0 ${polarToCartesian(cx,cy,r,135).x} ${polarToCartesian(cx,cy,r,135).y}" 
+                      fill="none" stroke="#1a1a1a" stroke-width="12" stroke-linecap="round"/>
+                <path d="${path}" fill="none" stroke="${color}" stroke-width="12" stroke-linecap="round"/>
+            `;
+        }
+        
+        function polarToCartesian(cx, cy, r, angle) {
+            const rad = (angle - 90) * Math.PI / 180;
+            return { x: cx + r * Math.cos(rad), y: cy + r * Math.sin(rad) };
         }
         
         // Chart drawing
         function drawChart(canvasId, points, color = '#22c55e') {
             const canvas = document.getElementById(canvasId);
-            if (!canvas || points.length < 2) return;
+            if (!canvas || points.length < 2) {
+                if (canvas) {
+                    const ctx = canvas.getContext('2d');
+                    const rect = canvas.getBoundingClientRect();
+                    canvas.width = rect.width * 2;
+                    canvas.height = rect.height * 2;
+                    ctx.scale(2, 2);
+                    ctx.fillStyle = '#666';
+                    ctx.font = '12px system-ui';
+                    ctx.fillText('No data', 10, rect.height / 2);
+                }
+                return;
+            }
             
-            const ctx = canvas.getContext('2d');
-            const rect = canvas.getBoundingClientRect();
-            canvas.width = rect.width * 2;
-            canvas.height = rect.height * 2;
-            ctx.scale(2, 2);
-            
-            const w = rect.width;
-            const h = rect.height;
-            const padding = 8;
-            
-            const vals = points.map(p => p.v);
-            const max = Math.max(...vals, 1);
-            const min = Math.min(...vals, 0);
-            const range = max - min || 1;
-            
-            // Draw line
-            ctx.beginPath();
-            points.forEach((p, i) => {
-                const x = padding + (i / (points.length - 1)) * (w - padding * 2);
-                const y = h - padding - ((p.v - min) / range) * (h - padding * 2);
-                if (i === 0) ctx.moveTo(x, y);
-                else ctx.lineTo(x, y);
-            });
-            ctx.strokeStyle = color;
-            ctx.lineWidth = 2;
-            ctx.stroke();
-            
-            // Fill under
-            ctx.lineTo(w - padding, h - padding);
-            ctx.lineTo(padding, h - padding);
-            ctx.closePath();
-            ctx.fillStyle = color + '20';
-            ctx.fill();
+            try {
+                const ctx = canvas.getContext('2d');
+                const rect = canvas.getBoundingClientRect();
+                canvas.width = rect.width * 2;
+                canvas.height = rect.height * 2;
+                ctx.scale(2, 2);
+                
+                const w = rect.width;
+                const h = rect.height;
+                const padding = 8;
+                
+                const vals = points.map(p => p.v);
+                const max = Math.max(...vals, 1);
+                const min = Math.min(...vals, 0);
+                const range = max - min || 1;
+                
+                ctx.beginPath();
+                points.forEach((p, i) => {
+                    const x = padding + (i / (points.length - 1)) * (w - padding * 2);
+                    const y = h - padding - ((p.v - min) / range) * (h - padding * 2);
+                    if (i === 0) ctx.moveTo(x, y);
+                    else ctx.lineTo(x, y);
+                });
+                ctx.strokeStyle = color;
+                ctx.lineWidth = 2;
+                ctx.stroke();
+                
+                ctx.lineTo(w - padding, h - padding);
+                ctx.lineTo(padding, h - padding);
+                ctx.closePath();
+                ctx.fillStyle = color + '20';
+                ctx.fill();
+            } catch(e) {
+                console.error('Chart error:', e);
+            }
         }
         
         // Update UI
@@ -834,26 +850,40 @@ DASHBOARD_HTML = '''
         
         // WebSocket connection
         function connect() {
-            ws = new WebSocket(`ws://${location.host}/ws`);
+            const wsUrl = `ws://${location.host}/ws`;
+            console.log('Connecting to', wsUrl);
             
-            ws.onopen = () => {
-                document.getElementById('status-dot').classList.add('connected');
-                document.getElementById('status-text').textContent = 'Connected';
-            };
-            
-            ws.onclose = () => {
-                document.getElementById('status-dot').classList.remove('connected');
-                document.getElementById('status-text').textContent = 'Disconnected';
+            try {
+                ws = new WebSocket(wsUrl);
+                
+                ws.onopen = () => {
+                    console.log('WebSocket connected');
+                    document.getElementById('status-dot').classList.add('connected');
+                    document.getElementById('status-text').textContent = 'Connected';
+                };
+                
+                ws.onclose = () => {
+                    console.log('WebSocket disconnected');
+                    document.getElementById('status-dot').classList.remove('connected');
+                    document.getElementById('status-text').textContent = 'Reconnecting...';
+                    setTimeout(connect, 2000);
+                };
+                
+                ws.onerror = (e) => {
+                    console.error('WebSocket error:', e);
+                };
+                
+                ws.onmessage = (event) => {
+                    const msg = JSON.parse(event.data);
+                    if (msg.type === 'sensor_update') {
+                        Object.assign(data, msg.data);
+                        updateUI();
+                    }
+                };
+            } catch(e) {
+                console.error('WebSocket init error:', e);
                 setTimeout(connect, 2000);
-            };
-            
-            ws.onmessage = (event) => {
-                const msg = JSON.parse(event.data);
-                if (msg.type === 'sensor_update') {
-                    Object.assign(data, msg.data);
-                    updateUI();
-                }
-            };
+            }
         }
         
         // Initial fetch
