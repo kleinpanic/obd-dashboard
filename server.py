@@ -10,6 +10,7 @@ import json
 import sqlite3
 import time
 import os
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 import threading
@@ -29,34 +30,115 @@ import uvicorn
 DATA_DIR = Path.home() / ".local/share/obdc"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DATA_DIR / "obdc.db"
+CONFIG_PATH = DATA_DIR / "config.json"
+
+# Default config
+DEFAULT_CONFIG = {
+    "theme": "dark",
+    "units": "metric",
+    "refresh_rate": 4
+}
+
+def load_config():
+    if CONFIG_PATH.exists():
+        try:
+            return json.loads(CONFIG_PATH.read_text())
+        except:
+            pass
+    return DEFAULT_CONFIG.copy()
+
+def save_config(cfg):
+    CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
+
+config = load_config()
 
 # Database setup
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
+    
+    # Sessions table
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS sessions (
+            id TEXT PRIMARY KEY,
+            start_time REAL,
+            end_time REAL,
+            distance_km REAL DEFAULT 0,
+            max_rpm INTEGER DEFAULT 0,
+            max_speed INTEGER DEFAULT 0,
+            avg_fuel REAL DEFAULT 0
+        )
+    ''')
+    
+    # Sensor data table (drop and recreate if schema changed)
+    c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='sensor_data'")
+    if c.fetchone():
+        c.execute("PRAGMA table_info(sensor_data)")
+        columns = [col[1] for col in c.fetchall()]
+        if 'session_id' not in columns:
+            c.execute("DROP TABLE sensor_data")
+    
     c.execute('''
         CREATE TABLE IF NOT EXISTS sensor_data (
             timestamp REAL,
+            session_id TEXT,
             sensor TEXT,
             value REAL,
             unit TEXT,
             PRIMARY KEY (timestamp, sensor)
         )
     ''')
+    
     c.execute('CREATE INDEX IF NOT EXISTS idx_sensor ON sensor_data(sensor)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_session ON sensor_data(session_id)')
     c.execute('CREATE INDEX IF NOT EXISTS idx_timestamp ON sensor_data(timestamp)')
+    
+    # DTC table
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS dtc_history (
+            timestamp REAL PRIMARY KEY,
+            code TEXT,
+            description TEXT,
+            cleared INTEGER DEFAULT 0
+        )
+    ''')
+    
     conn.commit()
     conn.close()
 
 init_db()
+
+current_session_id = str(uuid.uuid4())
+session_start_time = None
+
+def start_session():
+    global current_session_id, session_start_time
+    current_session_id = str(uuid.uuid4())
+    session_start_time = time.time()
+    
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT INTO sessions (id, start_time) VALUES (?, ?)", (current_session_id, session_start_time))
+    conn.commit()
+    conn.close()
+
+def end_session():
+    global session_start_time
+    if session_start_time:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("UPDATE sessions SET end_time = ? WHERE id = ?", (time.time(), current_session_id))
+        conn.commit()
+        conn.close()
+        session_start_time = None
 
 def log_sensor(sensor: str, value: float, unit: str):
     try:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
         c.execute(
-            "INSERT OR REPLACE INTO sensor_data (timestamp, sensor, value, unit) VALUES (?, ?, ?, ?)",
-            (time.time(), sensor, value, unit)
+            "INSERT OR REPLACE INTO sensor_data (timestamp, session_id, sensor, value, unit) VALUES (?, ?, ?, ?, ?)",
+            (time.time(), current_session_id, sensor, value, unit)
         )
         conn.commit()
         conn.close()
@@ -75,30 +157,52 @@ def get_recent_data(sensor: str, minutes: int = 30):
     conn.close()
     return rows
 
+def get_sessions(limit: int = 10):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''
+        SELECT id, start_time, end_time, distance_km, max_rpm, max_speed, avg_fuel 
+        FROM sessions 
+        WHERE end_time IS NOT NULL 
+        ORDER BY start_time DESC 
+        LIMIT ?
+    ''', (limit,))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
 # OBD Connection
 class OBDManager:
     def __init__(self):
         self.connection = None
         self.connected = False
+        self.connecting = False
         self.supported = []
         self.lock = threading.Lock()
-        self.last_data = {}  # Cache last good readings
+        self.last_data = {}
+        self.dtc_codes = []
         
     def connect(self):
         if not OBD_AVAILABLE:
             return False
+        
+        self.connecting = True
         ports = obd.scan_serial()
         if not ports:
+            self.connecting = False
             return False
         try:
             self.connection = obd.OBD(ports[0], protocol="6", fast=False)
             if self.connection.is_connected():
                 self.connected = True
+                self.connecting = False
                 self.supported = list(self.connection.supported_commands)
                 self.last_data = {}
+                start_session()
                 return True
         except Exception as e:
             print(f"OBD connect error: {e}")
+        self.connecting = False
         return False
     
     def disconnect(self):
@@ -108,13 +212,12 @@ class OBDManager:
             except:
                 pass
             self.connected = False
+            end_session()
     
     def is_healthy(self):
-        """Check if connection is still good"""
         if not self.connection or not self.connected:
             return False
         try:
-            # Quick ping - try to read status
             return self.connection.is_connected()
         except:
             return False
@@ -124,7 +227,6 @@ class OBDManager:
             return {}
         
         if not self.is_healthy():
-            print("OBD connection lost, attempting reconnect...")
             self.disconnect()
             if not self.connect():
                 return {}
@@ -151,7 +253,6 @@ class OBDManager:
                     except Exception as e:
                         pass
         
-        # Merge with last known good data for stability
         for k, v in self.last_data.items():
             if k not in data:
                 data[k] = v
@@ -193,10 +294,20 @@ class OBDManager:
         try:
             resp = self.connection.query(obd.commands.GET_DTC)
             if not resp.is_null():
-                return [(code, desc) for code, desc in resp.value]
+                self.dtc_codes = [(code, desc) for code, desc in resp.value]
+                return self.dtc_codes
         except:
             pass
         return []
+    
+    def clear_dtc(self):
+        if not self.connected:
+            return False
+        try:
+            resp = self.connection.query(obd.commands.CLEAR_DTC)
+            return True
+        except:
+            return False
 
 obd_manager = OBDManager()
 
@@ -233,7 +344,8 @@ async def obd_reader():
                     await ws_manager.broadcast({
                         "type": "sensor_update",
                         "timestamp": time.time(),
-                        "data": data
+                        "data": data,
+                        "session_id": current_session_id
                     })
                     consecutive_failures = 0
                 else:
@@ -247,20 +359,18 @@ async def obd_reader():
             except Exception as e:
                 print(f"OBD reader error: {e}")
                 consecutive_failures += 1
+        elif obd_manager.connecting:
+            await ws_manager.broadcast({"type": "status", "status": "connecting"})
         elif not obd_manager.connected and ws_manager.active_connections:
-            # Try to reconnect if we have clients but no OBD
-            print("Attempting OBD reconnect...")
+            await ws_manager.broadcast({"type": "status", "status": "disconnected"})
             obd_manager.connect()
         
-        await asyncio.sleep(0.25)  # 4Hz for smooth gauges
+        await asyncio.sleep(0.25)
 
-# Lifespan context manager
 @asynccontextmanager
 async def lifespan(app):
-    # Startup
     asyncio.create_task(obd_reader())
     yield
-    # Shutdown
     obd_manager.disconnect()
 
 app = FastAPI(title="OBD Commander", lifespan=lifespan)
@@ -274,8 +384,11 @@ async def root():
 async def status():
     return {
         "connected": obd_manager.connected,
+        "connecting": obd_manager.connecting,
         "sensors_supported": len(obd_manager.supported),
-        "vin": obd_manager.get_vin()
+        "vin": obd_manager.get_vin(),
+        "session_id": current_session_id,
+        "session_start": session_start_time
     }
 
 @app.get("/api/sensors")
@@ -291,6 +404,27 @@ async def history(sensor: str, minutes: int = 30):
 async def dtc():
     return {"dtc": obd_manager.get_dtc()}
 
+@app.post("/api/dtc/clear")
+async def clear_dtc():
+    if obd_manager.clear_dtc():
+        return {"status": "cleared"}
+    return {"status": "failed"}
+
+@app.get("/api/sessions")
+async def sessions():
+    return {"sessions": get_sessions()}
+
+@app.get("/api/config")
+async def get_config():
+    return config
+
+@app.post("/api/config")
+async def update_config(cfg: dict):
+    global config
+    config.update(cfg)
+    save_config(config)
+    return config
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await ws_manager.connect(websocket)
@@ -300,7 +434,7 @@ async def websocket_endpoint(websocket: WebSocket):
     except WebSocketDisconnect:
         ws_manager.disconnect(websocket)
 
-# Dashboard HTML with gauges
+# Dashboard HTML
 DASHBOARD_HTML = '''
 <!DOCTYPE html>
 <html lang="en">
@@ -309,7 +443,6 @@ DASHBOARD_HTML = '''
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
     <meta name="theme-color" content="#000000">
     <meta name="apple-mobile-web-app-capable" content="yes">
-    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <title>OBD Commander</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -324,19 +457,58 @@ DASHBOARD_HTML = '''
             --danger: #ef4444;
             --blue: #3b82f6;
         }
+        
+        [data-theme="light"] {
+            --bg: #f5f5f5;
+            --card: #fff;
+            --border: #e0e0e0;
+            --text: #000;
+            --muted: #888;
+        }
+        
         html, body { 
             height: 100%; 
-            font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', system-ui, sans-serif;
+            font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
             background: var(--bg);
             color: var(--text);
             overflow: hidden;
-            -webkit-font-smoothing: antialiased;
         }
         
         .app {
             display: flex;
             flex-direction: column;
             height: 100%;
+        }
+        
+        /* Connection overlay */
+        .connection-overlay {
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: var(--bg);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
+        }
+        
+        .connection-overlay.hidden { display: none; }
+        
+        .spinner {
+            width: 50px;
+            height: 50px;
+            border: 3px solid var(--border);
+            border-top-color: var(--accent);
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+        
+        @keyframes spin { to { transform: rotate(360deg); } }
+        
+        .connection-text {
+            margin-top: 20px;
+            font-size: 16px;
+            color: var(--muted);
         }
         
         /* Header */
@@ -349,11 +521,7 @@ DASHBOARD_HTML = '''
             flex-shrink: 0;
         }
         
-        .logo {
-            font-weight: 700;
-            font-size: 14px;
-            letter-spacing: -0.5px;
-        }
+        .logo { font-weight: 700; font-size: 14px; }
         
         .status {
             display: flex;
@@ -376,31 +544,25 @@ DASHBOARD_HTML = '''
         .page-container {
             flex: 1;
             overflow: hidden;
-            position: relative;
         }
         
         .page {
             position: absolute;
-            top: 0;
-            left: 0;
-            right: 0;
-            bottom: 0;
+            top: 0; left: 0; right: 0; bottom: 0;
             display: none;
             overflow-y: auto;
-            -webkit-overflow-scrolling: touch;
         }
         
         .page.active { display: block; }
         
-        /* Dashboard Page */
+        /* Dashboard */
         .dashboard {
+            padding: 16px;
             display: flex;
             flex-direction: column;
-            padding: 16px;
             gap: 16px;
         }
         
-        /* Main Gauges */
         .main-gauges {
             display: grid;
             grid-template-columns: 1fr 1fr;
@@ -437,17 +599,10 @@ DASHBOARD_HTML = '''
             line-height: 1;
         }
         
-        .gauge-unit {
-            font-size: 12px;
-            color: var(--muted);
-            margin-top: 2px;
-        }
-        
+        .gauge-unit { font-size: 12px; color: var(--muted); margin-top: 2px; }
         .gauge-label {
             position: absolute;
-            bottom: 12px;
-            left: 0;
-            right: 0;
+            bottom: 12px; left: 0; right: 0;
             text-align: center;
             font-size: 11px;
             color: var(--muted);
@@ -455,7 +610,6 @@ DASHBOARD_HTML = '''
             letter-spacing: 1px;
         }
         
-        /* Stats Grid */
         .stats-grid {
             display: grid;
             grid-template-columns: repeat(4, 1fr);
@@ -482,34 +636,6 @@ DASHBOARD_HTML = '''
             color: var(--muted);
             margin-top: 4px;
             text-transform: uppercase;
-            letter-spacing: 0.5px;
-        }
-        
-        /* Secondary Stats */
-        .history-stats {
-            display: grid;
-            grid-template-columns: repeat(4, 1fr);
-            gap: 8px;
-            margin-top: 12px;
-            padding-top: 12px;
-            border-top: 1px solid var(--border);
-        }
-        
-        .history-stat {
-            text-align: center;
-        }
-        
-        .history-stat-value {
-            font-size: 16px;
-            font-weight: 500;
-            font-variant-numeric: tabular-nums;
-            color: var(--accent);
-        }
-        
-        .history-stat-label {
-            font-size: 10px;
-            color: var(--muted);
-            text-transform: uppercase;
         }
         
         .secondary-stats {
@@ -522,14 +648,36 @@ DASHBOARD_HTML = '''
             padding: 16px;
         }
         
-        .stat-large .stat-value {
-            font-size: 28px;
+        .stat-large .stat-value { font-size: 28px; }
+        
+        /* Action buttons */
+        .action-buttons {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 8px;
+            margin-top: 8px;
         }
         
-        /* Sensors Page */
-        .sensors-page {
-            padding: 16px;
+        .action-btn {
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 12px;
+            color: var(--text);
+            font-size: 13px;
+            font-weight: 500;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
         }
+        
+        .action-btn:active { background: var(--border); }
+        .action-btn.danger { border-color: var(--danger); color: var(--danger); }
+        
+        /* Sensors page */
+        .sensors-page { padding: 16px; }
         
         .section-title {
             font-size: 11px;
@@ -551,13 +699,15 @@ DASHBOARD_HTML = '''
             border: 1px solid var(--border);
             border-radius: 8px;
             padding: 12px;
+            cursor: pointer;
         }
+        
+        .sensor-card:active { background: var(--border); }
         
         .sensor-name {
             font-size: 10px;
             color: var(--muted);
             text-transform: uppercase;
-            letter-spacing: 0.5px;
             margin-bottom: 4px;
             overflow: hidden;
             text-overflow: ellipsis;
@@ -568,19 +718,77 @@ DASHBOARD_HTML = '''
             font-size: 18px;
             font-weight: 500;
             font-variant-numeric: tabular-nums;
-            color: var(--text);
         }
         
-        .sensor-unit {
-            font-size: 10px;
-            color: var(--muted);
-            margin-left: 2px;
-        }
+        .sensor-unit { font-size: 10px; color: var(--muted); margin-left: 2px; }
         
-        /* History Page */
-        .history-page {
+        /* Sensor detail modal */
+        .modal {
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(0,0,0,0.8);
+            display: none;
+            align-items: center;
+            justify-content: center;
+            z-index: 100;
             padding: 16px;
         }
+        
+        .modal.active { display: flex; }
+        
+        .modal-content {
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            width: 100%;
+            max-width: 400px;
+            max-height: 80vh;
+            overflow-y: auto;
+        }
+        
+        .modal-header {
+            padding: 16px;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .modal-title { font-size: 16px; font-weight: 600; }
+        .modal-close {
+            background: none;
+            border: none;
+            color: var(--muted);
+            font-size: 24px;
+            cursor: pointer;
+        }
+        
+        .modal-body { padding: 16px; }
+        
+        .modal-chart {
+            height: 150px;
+            background: var(--bg);
+            border-radius: 8px;
+            margin-bottom: 16px;
+        }
+        
+        .modal-chart canvas { width: 100%; height: 100%; }
+        
+        .modal-stats {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 8px;
+        }
+        
+        .modal-stat {
+            background: var(--bg);
+            border-radius: 8px;
+            padding: 12px;
+            text-align: center;
+        }
+        
+        /* History page */
+        .history-page { padding: 16px; }
         
         .chart-container {
             background: var(--card);
@@ -596,14 +804,115 @@ DASHBOARD_HTML = '''
             margin-bottom: 12px;
         }
         
-        .chart {
-            height: 120px;
-            position: relative;
+        .chart { height: 120px; }
+        .chart canvas { width: 100%; height: 100%; }
+        
+        .history-stats {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 8px;
+            margin-top: 12px;
+            padding-top: 12px;
+            border-top: 1px solid var(--border);
         }
         
-        .chart canvas {
-            width: 100%;
-            height: 100%;
+        .history-stat { text-align: center; }
+        .history-stat-value { font-size: 16px; font-weight: 500; color: var(--accent); }
+        .history-stat-label { font-size: 10px; color: var(--muted); text-transform: uppercase; }
+        
+        /* Config page */
+        .config-page { padding: 16px; }
+        
+        .config-section {
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            margin-bottom: 12px;
+        }
+        
+        .config-item {
+            padding: 16px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid var(--border);
+        }
+        
+        .config-item:last-child { border-bottom: none; }
+        
+        .config-label { font-size: 14px; }
+        .config-desc { font-size: 11px; color: var(--muted); margin-top: 2px; }
+        
+        .toggle {
+            width: 50px;
+            height: 28px;
+            background: var(--border);
+            border-radius: 14px;
+            position: relative;
+            cursor: pointer;
+        }
+        
+        .toggle.active { background: var(--accent); }
+        
+        .toggle::after {
+            content: '';
+            position: absolute;
+            width: 24px;
+            height: 24px;
+            background: var(--text);
+            border-radius: 50%;
+            top: 2px;
+            left: 2px;
+            transition: left 0.2s;
+        }
+        
+        .toggle.active::after { left: 24px; }
+        
+        /* DTC modal */
+        .dtc-list { margin: 16px 0; }
+        
+        .dtc-item {
+            background: var(--bg);
+            border-radius: 8px;
+            padding: 12px;
+            margin-bottom: 8px;
+        }
+        
+        .dtc-code { font-weight: 600; color: var(--warning); }
+        .dtc-desc { font-size: 12px; color: var(--muted); margin-top: 4px; }
+        
+        .no-dtc { text-align: center; color: var(--accent); padding: 20px; }
+        
+        /* Confirm modal */
+        .confirm-text {
+            text-align: center;
+            padding: 20px;
+            color: var(--muted);
+        }
+        
+        .confirm-buttons {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 8px;
+            padding: 16px;
+        }
+        
+        .confirm-btn {
+            padding: 12px;
+            border-radius: 8px;
+            border: none;
+            font-weight: 500;
+            cursor: pointer;
+        }
+        
+        .confirm-btn.cancel {
+            background: var(--border);
+            color: var(--text);
+        }
+        
+        .confirm-btn.confirm {
+            background: var(--danger);
+            color: #fff;
         }
         
         /* Nav */
@@ -629,21 +938,20 @@ DASHBOARD_HTML = '''
             gap: 4px;
         }
         
-        nav button.active {
-            color: var(--accent);
-        }
+        nav button.active { color: var(--accent); }
+        nav button svg { width: 20px; height: 20px; }
         
-        nav button svg {
-            width: 20px;
-            height: 20px;
-        }
-        
-        /* Warnings */
         .warning { color: var(--warning); }
         .danger { color: var(--danger); }
     </style>
 </head>
-<body>
+<body data-theme="dark">
+    <!-- Connection overlay -->
+    <div class="connection-overlay" id="connection-overlay">
+        <div class="spinner"></div>
+        <div class="connection-text">Connecting to OBD...</div>
+    </div>
+    
     <div class="app">
         <header>
             <div class="logo">OBD Commander</div>
@@ -670,7 +978,7 @@ DASHBOARD_HTML = '''
                             <svg class="gauge-svg" viewBox="0 0 200 200" id="speed-gauge"></svg>
                             <div class="gauge-center">
                                 <div class="gauge-value" id="speed-value">0</div>
-                                <div class="gauge-unit">km/h</div>
+                                <div class="gauge-unit" id="speed-unit">km/h</div>
                             </div>
                             <div class="gauge-label">Speed</div>
                         </div>
@@ -679,7 +987,7 @@ DASHBOARD_HTML = '''
                     <div class="stats-grid">
                         <div class="stat">
                             <div class="stat-value" id="intake-value">--</div>
-                            <div class="stat-label">Intake °C</div>
+                            <div class="stat-label">Intake °</div>
                         </div>
                         <div class="stat">
                             <div class="stat-value" id="load-value">--</div>
@@ -710,8 +1018,26 @@ DASHBOARD_HTML = '''
                         </div>
                         <div class="stat stat-large">
                             <div class="stat-value" id="oil-value">--</div>
-                            <div class="stat-label">Oil °C</div>
+                            <div class="stat-label">Oil °</div>
                         </div>
+                    </div>
+                    
+                    <div class="action-buttons">
+                        <button class="action-btn" onclick="showDTC()">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <circle cx="12" cy="12" r="10"/>
+                                <line x1="12" y1="8" x2="12" y2="12"/>
+                                <line x1="12" y1="16" x2="12.01" y2="16"/>
+                            </svg>
+                            View Codes
+                        </button>
+                        <button class="action-btn danger" onclick="confirmClearDTC()">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <polyline points="3 6 5 6 21 6"/>
+                                <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+                            </svg>
+                            Clear Codes
+                        </button>
                     </div>
                 </div>
             </div>
@@ -719,7 +1045,7 @@ DASHBOARD_HTML = '''
             <!-- Sensors Page -->
             <div class="page" id="page-sensors">
                 <div class="sensors-page">
-                    <div class="section-title">All Sensors</div>
+                    <div class="section-title">All Sensors (tap for details)</div>
                     <div class="sensors-grid" id="sensors-grid"></div>
                 </div>
             </div>
@@ -749,6 +1075,46 @@ DASHBOARD_HTML = '''
                     </div>
                 </div>
             </div>
+            
+            <!-- Config Page -->
+            <div class="page" id="page-config">
+                <div class="config-page">
+                    <div class="section-title">Settings</div>
+                    
+                    <div class="config-section">
+                        <div class="config-item">
+                            <div>
+                                <div class="config-label">Dark Mode</div>
+                                <div class="config-desc">Toggle dark/light theme</div>
+                            </div>
+                            <div class="toggle active" id="theme-toggle" onclick="toggleTheme()"></div>
+                        </div>
+                        <div class="config-item">
+                            <div>
+                                <div class="config-label">Metric Units</div>
+                                <div class="config-desc">km/h, °C, L/100km</div>
+                            </div>
+                            <div class="toggle active" id="units-toggle" onclick="toggleUnits()"></div>
+                        </div>
+                    </div>
+                    
+                    <div class="section-title">Session Info</div>
+                    <div class="config-section">
+                        <div class="config-item">
+                            <div>
+                                <div class="config-label">Session ID</div>
+                                <div class="config-desc" id="session-id">--</div>
+                            </div>
+                        </div>
+                        <div class="config-item">
+                            <div>
+                                <div class="config-label">Session Start</div>
+                                <div class="config-desc" id="session-start">--</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
         </div>
         
         <nav>
@@ -775,14 +1141,101 @@ DASHBOARD_HTML = '''
                 </svg>
                 History
             </button>
+            <button onclick="showPage('config')">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <circle cx="12" cy="12" r="3"/>
+                    <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+                </svg>
+                Config
+            </button>
         </nav>
+    </div>
+    
+    <!-- Sensor Detail Modal -->
+    <div class="modal" id="sensor-modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <div class="modal-title" id="sensor-modal-title">Sensor</div>
+                <button class="modal-close" onclick="closeSensorModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="modal-chart"><canvas id="sensor-chart"></canvas></div>
+                <div class="modal-stats" id="sensor-modal-stats"></div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- DTC Modal -->
+    <div class="modal" id="dtc-modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <div class="modal-title">Diagnostic Codes</div>
+                <button class="modal-close" onclick="closeDTCModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="dtc-list" id="dtc-list"></div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Confirm Modal -->
+    <div class="modal" id="confirm-modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <div class="modal-title">Confirm Action</div>
+                <button class="modal-close" onclick="closeConfirmModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="confirm-text">Are you sure you want to clear all diagnostic codes?</div>
+                <div class="confirm-buttons">
+                    <button class="confirm-btn cancel" onclick="closeConfirmModal()">Cancel</button>
+                    <button class="confirm-btn confirm" onclick="clearDTC()">Clear Codes</button>
+                </div>
+            </div>
+        </div>
     </div>
     
     <script>
         const data = {};
+        let config = { theme: 'dark', units: 'metric' };
         let ws;
+        let isConnected = false;
         
-        // Gauge drawing with SVG
+        // Load config
+        fetch('/api/config').then(r => r.json()).then(c => {
+            config = c;
+            applyConfig();
+        });
+        
+        function applyConfig() {
+            document.body.dataset.theme = config.theme;
+            document.getElementById('theme-toggle').classList.toggle('active', config.theme === 'dark');
+            document.getElementById('units-toggle').classList.toggle('active', config.units === 'metric');
+        }
+        
+        function toggleTheme() {
+            config.theme = config.theme === 'dark' ? 'light' : 'dark';
+            applyConfig();
+            fetch('/api/config', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(config) });
+        }
+        
+        function toggleUnits() {
+            config.units = config.units === 'metric' ? 'imperial' : 'metric';
+            applyConfig();
+            fetch('/api/config', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(config) });
+            updateUI();
+        }
+        
+        // Convert units
+        function convertSpeed(kmh) {
+            return config.units === 'metric' ? kmh : kmh * 0.621371;
+        }
+        
+        function convertTemp(c) {
+            return config.units === 'metric' ? c : c * 9/5 + 32;
+        }
+        
+        // Gauge drawing
         function drawGauge(svgId, value, max, color = '#22c55e') {
             const svg = document.getElementById(svgId);
             if (!svg) return;
@@ -791,7 +1244,6 @@ DASHBOARD_HTML = '''
             const startAngle = -135;
             const endAngle = startAngle + (270 * percent);
             
-            // Calculate arc path
             const cx = 100, cy = 100, r = 80;
             const start = polarToCartesian(cx, cy, r, endAngle);
             const end = polarToCartesian(cx, cy, r, startAngle);
@@ -814,75 +1266,62 @@ DASHBOARD_HTML = '''
         // Chart drawing
         function drawChart(canvasId, points, color = '#22c55e') {
             const canvas = document.getElementById(canvasId);
-            if (!canvas || points.length < 2) {
-                if (canvas) {
-                    const ctx = canvas.getContext('2d');
-                    const rect = canvas.getBoundingClientRect();
-                    canvas.width = rect.width * 2;
-                    canvas.height = rect.height * 2;
-                    ctx.scale(2, 2);
-                    ctx.fillStyle = '#666';
-                    ctx.font = '12px system-ui';
-                    ctx.fillText('No data', 10, rect.height / 2);
-                }
+            if (!canvas) return;
+            
+            const ctx = canvas.getContext('2d');
+            const rect = canvas.getBoundingClientRect();
+            canvas.width = rect.width * 2;
+            canvas.height = rect.height * 2;
+            ctx.scale(2, 2);
+            
+            if (!points || points.length < 2) {
+                ctx.fillStyle = '#666';
+                ctx.font = '12px system-ui';
+                ctx.fillText('No data', 10, rect.height / 2);
                 return;
             }
             
-            try {
-                const ctx = canvas.getContext('2d');
-                const rect = canvas.getBoundingClientRect();
-                canvas.width = rect.width * 2;
-                canvas.height = rect.height * 2;
-                ctx.scale(2, 2);
-                
-                const w = rect.width;
-                const h = rect.height;
-                const padding = 8;
-                
-                const vals = points.map(p => p.v);
-                const max = Math.max(...vals, 1);
-                const min = Math.min(...vals, 0);
-                const range = max - min || 1;
-                
-                ctx.beginPath();
-                points.forEach((p, i) => {
-                    const x = padding + (i / (points.length - 1)) * (w - padding * 2);
-                    const y = h - padding - ((p.v - min) / range) * (h - padding * 2);
-                    if (i === 0) ctx.moveTo(x, y);
-                    else ctx.lineTo(x, y);
-                });
-                ctx.strokeStyle = color;
-                ctx.lineWidth = 2;
-                ctx.stroke();
-                
-                ctx.lineTo(w - padding, h - padding);
-                ctx.lineTo(padding, h - padding);
-                ctx.closePath();
-                ctx.fillStyle = color + '20';
-                ctx.fill();
-            } catch(e) {
-                console.error('Chart error:', e);
-            }
+            const w = rect.width, h = rect.height, padding = 8;
+            const vals = points.map(p => p.v);
+            const max = Math.max(...vals, 1);
+            const min = Math.min(...vals, 0);
+            const range = max - min || 1;
+            
+            ctx.beginPath();
+            points.forEach((p, i) => {
+                const x = padding + (i / (points.length - 1)) * (w - padding * 2);
+                const y = h - padding - ((p.v - min) / range) * (h - padding * 2);
+                if (i === 0) ctx.moveTo(x, y);
+                else ctx.lineTo(x, y);
+            });
+            ctx.strokeStyle = color;
+            ctx.lineWidth = 2;
+            ctx.stroke();
+            
+            ctx.lineTo(w - padding, h - padding);
+            ctx.lineTo(padding, h - padding);
+            ctx.closePath();
+            ctx.fillStyle = color + '20';
+            ctx.fill();
         }
         
         // Update UI
         function updateUI() {
-            // RPM
             const rpm = data.RPM?.value || 0;
             const rpmEl = document.getElementById('rpm-value');
             rpmEl.textContent = Math.round(rpm).toLocaleString();
             rpmEl.className = 'gauge-value' + (rpm > 6000 ? ' danger' : rpm > 5000 ? ' warning' : '');
-            drawGauge(document.getElementById('rpm-gauge'), rpm, 8000, rpm > 6000 ? '#ef4444' : rpm > 5000 ? '#f59e0b' : '#22c55e');
+            drawGauge('rpm-gauge', rpm, 8000, rpm > 6000 ? '#ef4444' : rpm > 5000 ? '#f59e0b' : '#22c55e');
             
-            // Speed
-            const speed = data.SPEED?.value || 0;
+            const speedKmh = data.SPEED?.value || 0;
+            const speed = convertSpeed(speedKmh);
             document.getElementById('speed-value').textContent = Math.round(speed);
-            drawGauge(document.getElementById('speed-gauge'), speed, 200, '#3b82f6');
+            document.getElementById('speed-unit').textContent = config.units === 'metric' ? 'km/h' : 'mph';
+            drawGauge('speed-gauge', speed, config.units === 'metric' ? 200 : 125, '#3b82f6');
             
-            // Stats
             const format = (v, u) => v !== undefined ? `${Math.round(v)}${u}` : '--';
             
-            document.getElementById('intake-value').textContent = format(data.INTAKE_TEMP?.value, '°');
+            document.getElementById('intake-value').textContent = format(convertTemp(data.INTAKE_TEMP?.value), '°');
             document.getElementById('load-value').textContent = format(data.ENGINE_LOAD?.value, '%');
             document.getElementById('throttle-value').textContent = format(data.THROTTLE_POS?.value, '%');
             document.getElementById('timing-value').textContent = format(data.TIMING_ADVANCE?.value, '°');
@@ -894,32 +1333,110 @@ DASHBOARD_HTML = '''
             
             document.getElementById('maf-value').textContent = data.MAF?.value ? `${data.MAF.value.toFixed(1)}` : '--';
             document.getElementById('voltage-value').textContent = data.CONTROL_MODULE_VOLTAGE?.value ? `${data.CONTROL_MODULE_VOLTAGE.value.toFixed(1)}` : '--';
-            document.getElementById('oil-value').textContent = data.OIL_TEMP?.value ? `${Math.round(data.OIL_TEMP.value)}°` : '--';
+            document.getElementById('oil-value').textContent = data.OIL_TEMP?.value ? `${Math.round(convertTemp(data.OIL_TEMP.value))}°` : '--';
             
             // Sensors list
             const grid = document.getElementById('sensors-grid');
             grid.innerHTML = Object.entries(data)
                 .filter(([k]) => !['RPM', 'SPEED'].includes(k))
                 .map(([name, val]) => `
-                    <div class="sensor-card">
+                    <div class="sensor-card" onclick="showSensorDetail('${name}')">
                         <div class="sensor-name">${name.replace(/_/g, ' ')}</div>
                         <div class="sensor-value">${val.value.toFixed(1)}<span class="sensor-unit">${val.unit}</span></div>
                     </div>
                 `).join('');
         }
         
-        // Page navigation
-        function showPage(page) {
-            document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
-            document.querySelectorAll('nav button').forEach(b => b.classList.remove('active'));
-            document.getElementById(`page-${page}`).classList.add('active');
-            event.target.closest('button').classList.add('active');
+        // Sensor detail modal
+        async function showSensorDetail(sensor) {
+            document.getElementById('sensor-modal-title').textContent = sensor.replace(/_/g, ' ');
+            document.getElementById('sensor-modal').classList.add('active');
             
-            if (page === 'history') {
-                fetchHistory();
+            try {
+                const history = await fetch(`/api/history/${sensor}?minutes=30`).then(r => r.json());
+                drawChart('sensor-chart', history, '#22c55e');
+                
+                if (history && history.length > 0) {
+                    const values = history.map(p => p.v);
+                    const min = Math.min(...values);
+                    const max = Math.max(...values);
+                    const avg = values.reduce((a, b) => a + b, 0) / values.length;
+                    const current = values[values.length - 1];
+                    
+                    document.getElementById('sensor-modal-stats').innerHTML = `
+                        <div class="modal-stat">
+                            <div class="history-stat-value">${current.toFixed(1)}</div>
+                            <div class="history-stat-label">Current</div>
+                        </div>
+                        <div class="modal-stat">
+                            <div class="history-stat-value">${avg.toFixed(1)}</div>
+                            <div class="history-stat-label">Average</div>
+                        </div>
+                        <div class="modal-stat">
+                            <div class="history-stat-value">${min.toFixed(1)}</div>
+                            <div class="history-stat-label">Min</div>
+                        </div>
+                        <div class="modal-stat">
+                            <div class="history-stat-value">${max.toFixed(1)}</div>
+                            <div class="history-stat-label">Max</div>
+                        </div>
+                    `;
+                }
+            } catch(e) {
+                console.error(e);
             }
         }
         
+        function closeSensorModal() {
+            document.getElementById('sensor-modal').classList.remove('active');
+        }
+        
+        // DTC
+        async function showDTC() {
+            document.getElementById('dtc-modal').classList.add('active');
+            
+            try {
+                const result = await fetch('/api/dtc').then(r => r.json());
+                const list = document.getElementById('dtc-list');
+                
+                if (result.dtc && result.dtc.length > 0) {
+                    list.innerHTML = result.dtc.map(([code, desc]) => `
+                        <div class="dtc-item">
+                            <div class="dtc-code">${code}</div>
+                            <div class="dtc-desc">${desc || 'Unknown'}</div>
+                        </div>
+                    `).join('');
+                } else {
+                    list.innerHTML = '<div class="no-dtc">✓ No diagnostic codes</div>';
+                }
+            } catch(e) {
+                console.error(e);
+            }
+        }
+        
+        function closeDTCModal() {
+            document.getElementById('dtc-modal').classList.remove('active');
+        }
+        
+        function confirmClearDTC() {
+            document.getElementById('confirm-modal').classList.add('active');
+        }
+        
+        function closeConfirmModal() {
+            document.getElementById('confirm-modal').classList.remove('active');
+        }
+        
+        async function clearDTC() {
+            try {
+                await fetch('/api/dtc/clear', { method: 'POST' });
+                closeConfirmModal();
+                showDTC();
+            } catch(e) {
+                console.error(e);
+            }
+        }
+        
+        // History stats
         function renderHistoryStats(containerId, points, unit = '') {
             if (!points || points.length < 2) return '';
             
@@ -966,13 +1483,34 @@ DASHBOARD_HTML = '''
                 drawChart('load-chart', load, '#f59e0b');
                 drawChart('fuel-chart', fuel, '#22c55e');
                 
-                renderHistoryStats('speed-stats', speed, ' km/h');
+                renderHistoryStats('speed-stats', speed, config.units === 'metric' ? ' km/h' : ' mph');
                 renderHistoryStats('rpm-stats', rpm, ' RPM');
                 renderHistoryStats('load-stats', load, '%');
                 renderHistoryStats('fuel-stats', fuel, '%');
             } catch (e) {
                 console.error('Failed to fetch history', e);
             }
+        }
+        
+        // Page navigation
+        function showPage(page) {
+            document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+            document.querySelectorAll('nav button').forEach(b => b.classList.remove('active'));
+            document.getElementById(`page-${page}`).classList.add('active');
+            event.target.closest('button').classList.add('active');
+            
+            if (page === 'history') fetchHistory();
+            if (page === 'config') updateSessionInfo();
+        }
+        
+        async function updateSessionInfo() {
+            try {
+                const status = await fetch('/api/status').then(r => r.json());
+                document.getElementById('session-id').textContent = status.session_id?.substring(0, 8) || '--';
+                document.getElementById('session-start').textContent = status.session_start 
+                    ? new Date(status.session_start * 1000).toLocaleTimeString() 
+                    : '--';
+            } catch(e) {}
         }
         
         // WebSocket connection
@@ -985,26 +1523,35 @@ DASHBOARD_HTML = '''
                 
                 ws.onopen = () => {
                     console.log('WebSocket connected');
+                    isConnected = true;
                     document.getElementById('status-dot').classList.add('connected');
                     document.getElementById('status-text').textContent = 'Connected';
+                    document.getElementById('connection-overlay').classList.add('hidden');
                 };
                 
                 ws.onclose = () => {
                     console.log('WebSocket disconnected');
+                    isConnected = false;
                     document.getElementById('status-dot').classList.remove('connected');
                     document.getElementById('status-text').textContent = 'Reconnecting...';
+                    document.getElementById('connection-overlay').classList.remove('hidden');
                     setTimeout(connect, 2000);
                 };
                 
-                ws.onerror = (e) => {
-                    console.error('WebSocket error:', e);
-                };
+                ws.onerror = (e) => console.error('WebSocket error:', e);
                 
                 ws.onmessage = (event) => {
                     const msg = JSON.parse(event.data);
                     if (msg.type === 'sensor_update') {
                         Object.assign(data, msg.data);
                         updateUI();
+                    } else if (msg.type === 'status') {
+                        if (msg.status === 'connecting') {
+                            document.getElementById('connection-overlay').classList.remove('hidden');
+                            document.querySelector('.connection-text').textContent = 'Connecting to OBD...';
+                        } else if (msg.status === 'disconnected') {
+                            document.querySelector('.connection-text').textContent = 'OBD Disconnected - Reconnecting...';
+                        }
                     }
                 };
             } catch(e) {
@@ -1029,7 +1576,7 @@ if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(description="OBD Commander Car Computer")
-    parser.add_argument("--port", "-p", type=int, default=8000)
+    parser.add_argument("--port", "-p", type=int, default=9000)
     parser.add_argument("--host", default="0.0.0.0")
     args = parser.parse_args()
     
@@ -1041,7 +1588,7 @@ if __name__ == "__main__":
         if obd_manager.connect():
             print(f"✓ Connected! {len(obd_manager.supported)} sensors")
         else:
-            print("✗ No OBD connection")
+            print("✗ No OBD connection - will retry...")
     else:
         print("✗ OBD library not installed")
     
