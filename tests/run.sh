@@ -1,11 +1,18 @@
 #!/bin/bash
 # Comprehensive test suite for OBD Commander
 
-set -e
+# Don't exit on error - handle errors ourselves
+set +e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 BINARY="$ROOT_DIR/obdc"
+
+# Get python path
+PYTHON="python3"
+if [ -d "$ROOT_DIR/venv" ]; then
+    PYTHON="$ROOT_DIR/venv/bin/python3"
+fi
 
 echo "=========================================="
 echo "OBD Commander Test Suite"
