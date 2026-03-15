@@ -49,12 +49,18 @@ else
     fail "Invalid flag not handled"
 fi
 
+# Get python path
+PYTHON="python3"
+if [ -d "$ROOT_DIR/venv" ]; then
+    PYTHON="$ROOT_DIR/venv/bin/python3"
+fi
+
 # === CLI Tests ===
 echo ""
 echo "=== CLI Tests ==="
 
 echo -n "Server status (not running)... "
-RESULT=$("$BINARY" server status 2>&1)
+RESULT=$($PYTHON "$BINARY" server status 2>&1)
 if echo "$RESULT" | grep -q '"running"'; then
     pass "Server status command works"
 else
@@ -62,7 +68,7 @@ else
 fi
 
 echo -n "Database stats... "
-RESULT=$("$BINARY" db stats 2>&1)
+RESULT=$($PYTHON "$BINARY" db stats 2>&1)
 if echo "$RESULT" | grep -q "total_readings\|error"; then
     pass "Database stats works"
 else
@@ -70,7 +76,7 @@ else
 fi
 
 echo -n "MCP tools list... "
-RESULT=$("$BINARY" mcp tools 2>&1)
+RESULT=$($PYTHON "$BINARY" mcp tools 2>&1)
 if echo "$RESULT" | grep -q "obdc_get_status"; then
     pass "MCP tools available"
 else
