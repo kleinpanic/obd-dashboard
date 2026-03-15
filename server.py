@@ -512,7 +512,6 @@ async def get_config():
 
 @app.post("/api/config")
 async def update_config(cfg: dict):
-    global config
     config.update(cfg)
     save_config(config)
     return config
