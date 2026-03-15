@@ -1058,6 +1058,33 @@ DASHBOARD_HTML = '''
         
         .stat-large .stat-value { font-size: 28px; }
         
+        /* Sparkline graphs */
+        .sparkline-container {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 8px;
+            margin-bottom: 16px;
+        }
+        
+        .sparkline-card {
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 8px;
+        }
+        
+        .sparkline-label {
+            font-size: 10px;
+            color: var(--muted);
+            text-transform: uppercase;
+            margin-bottom: 4px;
+        }
+        
+        .sparkline-canvas {
+            height: 40px;
+            width: 100%;
+        }
+        
         /* Action buttons */
         .action-buttons {
             display: grid;
@@ -1396,6 +1423,26 @@ DASHBOARD_HTML = '''
                         </div>
                     </div>
                     
+                    <!-- Mini Sparkline Graphs -->
+                    <div class="sparkline-container">
+                        <div class="sparkline-card">
+                            <div class="sparkline-label">RPM</div>
+                            <canvas id="rpm-sparkline" class="sparkline-canvas"></canvas>
+                        </div>
+                        <div class="sparkline-card">
+                            <div class="sparkline-label">Speed</div>
+                            <canvas id="speed-sparkline" class="sparkline-canvas"></canvas>
+                        </div>
+                        <div class="sparkline-card">
+                            <div class="sparkline-label">Load</div>
+                            <canvas id="load-sparkline" class="sparkline-canvas"></canvas>
+                        </div>
+                        <div class="sparkline-card">
+                            <div class="sparkline-label">Throttle</div>
+                            <canvas id="throttle-sparkline" class="sparkline-canvas"></canvas>
+                        </div>
+                    </div>
+                    
                     <div class="stats-grid">
                         <div class="stat" data-tooltip="Air temperature entering the engine">
                             <div class="stat-value" id="intake-value">--</div>
@@ -1608,14 +1655,14 @@ DASHBOARD_HTML = '''
         </div>
         
         <nav>
-            <button class="active" onclick="showPage('dashboard')">
+            <button class="active" onclick="showPage('dashboard', this)">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                     <circle cx="12" cy="12" r="10"/>
                     <path d="M12 6v6l4 2"/>
                 </svg>
                 Dashboard
             </button>
-            <button onclick="showPage('sensors')">
+            <button onclick="showPage('sensors', this)">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                     <rect x="3" y="3" width="7" height="7"/>
                     <rect x="14" y="3" width="7" height="7"/>
@@ -1624,14 +1671,14 @@ DASHBOARD_HTML = '''
                 </svg>
                 Sensors
             </button>
-            <button onclick="showPage('history')">
+            <button onclick="showPage('history', this)">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                     <path d="M3 3v18h18"/>
                     <path d="M18 9l-5 5-4-4-3 3"/>
                 </svg>
                 History
             </button>
-            <button onclick="showPage('config')">
+            <button onclick="showPage('config', this)">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                     <circle cx="12" cy="12" r="3"/>
                     <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/>
@@ -1693,11 +1740,26 @@ DASHBOARD_HTML = '''
         let ws;
         let isConnected = false;
         
+        // Sparkline data buffers (keep last 60 points = 15 seconds at 4Hz)
+        const sparklineData = {
+            RPM: [],
+            SPEED: [],
+            ENGINE_LOAD: [],
+            THROTTLE_POS: []
+        };
+        const SPARKLINE_MAX = 60;
+        
         // Load config
-        fetch('/api/config').then(r => r.json()).then(c => {
-            config = c;
-            applyConfig();
-        });
+        fetch('/api/config')
+            .then(r => r.json())
+            .then(c => {
+                config = c;
+                applyConfig();
+            })
+            .catch(() => {
+                // Use defaults if fetch fails
+                console.log('Using default config');
+            });
         
         function applyConfig() {
             document.body.dataset.theme = config.theme;
@@ -1762,6 +1824,44 @@ DASHBOARD_HTML = '''
         function polarToCartesian(cx, cy, r, angle) {
             const rad = (angle - 90) * Math.PI / 180;
             return { x: cx + r * Math.cos(rad), y: cy + r * Math.sin(rad) };
+        }
+        
+        // Sparkline drawing
+        function drawSparkline(canvasId, values, color = '#22c55e') {
+            const canvas = document.getElementById(canvasId);
+            if (!canvas || values.length < 2) return;
+            
+            const ctx = canvas.getContext('2d');
+            const rect = canvas.getBoundingClientRect();
+            canvas.width = rect.width * 2;
+            canvas.height = rect.height * 2;
+            ctx.scale(2, 2);
+            
+            const w = rect.width;
+            const h = rect.height;
+            const padding = 2;
+            
+            const max = Math.max(...values, 1);
+            const min = Math.min(...values, 0);
+            const range = max - min || 1;
+            
+            ctx.beginPath();
+            values.forEach((v, i) => {
+                const x = padding + (i / (values.length - 1)) * (w - padding * 2);
+                const y = h - padding - ((v - min) / range) * (h - padding * 2);
+                if (i === 0) ctx.moveTo(x, y);
+                else ctx.lineTo(x, y);
+            });
+            ctx.strokeStyle = color;
+            ctx.lineWidth = 1.5;
+            ctx.stroke();
+        }
+        
+        function updateSparklines() {
+            drawSparkline('rpm-sparkline', sparklineData.RPM, '#22c55e');
+            drawSparkline('speed-sparkline', sparklineData.SPEED, '#3b82f6');
+            drawSparkline('load-sparkline', sparklineData.ENGINE_LOAD, '#f59e0b');
+            drawSparkline('throttle-sparkline', sparklineData.THROTTLE_POS, '#a855f7');
         }
         
         // Chart drawing
@@ -1851,6 +1951,27 @@ DASHBOARD_HTML = '''
             const oilTemp = data.OIL_TEMP?.value;
             document.getElementById('oil-value').textContent = oilTemp ? Math.round(convertTemp(oilTemp)) : '--';
             document.getElementById('oil-label').textContent = `Oil ${unitC}`;
+            
+            // Update sparkline buffers
+            if (rpm > 0) {
+                sparklineData.RPM.push(rpm);
+                if (sparklineData.RPM.length > SPARKLINE_MAX) sparklineData.RPM.shift();
+            }
+            if (speedKmh > 0) {
+                sparklineData.SPEED.push(speedKmh);
+                if (sparklineData.SPEED.length > SPARKLINE_MAX) sparklineData.SPEED.shift();
+            }
+            if (load > 0) {
+                sparklineData.ENGINE_LOAD.push(load);
+                if (sparklineData.ENGINE_LOAD.length > SPARKLINE_MAX) sparklineData.ENGINE_LOAD.shift();
+            }
+            const throttle = data.THROTTLE_POS?.value || 0;
+            if (throttle >= 0) {
+                sparklineData.THROTTLE_POS.push(throttle);
+                if (sparklineData.THROTTLE_POS.length > SPARKLINE_MAX) sparklineData.THROTTLE_POS.shift();
+            }
+            
+            updateSparklines();
             
             // Sensors list
             const grid = document.getElementById('sensors-grid');
@@ -2045,11 +2166,13 @@ DASHBOARD_HTML = '''
         }
         
         // Page navigation
-        function showPage(page) {
+        function showPage(page, btnElement) {
             document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
             document.querySelectorAll('nav button').forEach(b => b.classList.remove('active'));
             document.getElementById(`page-${page}`).classList.add('active');
-            event.target.closest('button').classList.add('active');
+            if (btnElement) {
+                btnElement.classList.add('active');
+            }
             
             if (page === 'history') fetchHistory();
             if (page === 'config') updateSessionInfo();
