@@ -792,7 +792,12 @@ async def update_vehicle(data: dict):
 
 @app.get("/api/sensors")
 async def sensors():
-    return obd_manager.read_all()
+    # Return cached data — avoids blocking the event loop with 122 synchronous OBD queries.
+    # last_sensor_data is kept fresh by the WS reader loop at 4Hz.
+    # Falls back to last_data which accumulates across all queries.
+    if obd_manager.last_sensor_data:
+        return obd_manager.last_sensor_data
+    return obd_manager.last_data
 
 @app.get("/api/history/{sensor}")
 async def history(sensor: str, minutes: int = 30):
