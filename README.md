@@ -1,107 +1,129 @@
 # OBD Commander
 
-CLI and web interface for OBD-II vehicles. Agent-friendly (JSON output) + human dashboard.
+Car computer backend for OBD-II vehicles. WebSocket server + SQLite logging + REST API. Optimized for RPi4 car computer setup.
 
 ## Features
 
-- **Vehicle-agnostic**: Works with any OBD-II vehicle (1996+)
-- **CLI-first**: JSON output for agents and scripts
-- **Web dashboard**: Mobile-friendly real-time UI
-- **Read-only by default**: Safe for driving
-- **VIN decoding**: Get vehicle identification
-- **DTC scanning**: Read diagnostic trouble codes
-- **Capabilities analysis**: See what sensors are available
+- **WebSocket server**: Real-time push updates (no polling)
+- **SQLite logging**: Historical data storage
+- **Mobile-first UI**: Dark theme, PWA installable
+- **Offline-capable**: Works without WiFi
+- **Small footprint**: Designed for RPi4
+- **Read-only**: Safe for driving
 
-## Install
+## Quick Start
 
 ```bash
+# Setup
 python3 -m venv venv
 source venv/bin/activate
-pip install obd flask flask-cors
+pip install -r requirements.txt
+
+# Run
+python server.py
+
+# Open http://localhost:8000 on your phone
 ```
 
-## CLI Usage
+## Architecture
 
-```bash
-# Connection status and vehicle info
-./obdc status
-
-# Get VIN
-./obdc vin
-
-# Scan all supported sensors
-./obdc scan
-
-# Get single sensor
-./obdc get RPM
-./obdc get SPEED
-
-# Stream live data (JSON lines - for agents)
-./obdc live
-
-# Get diagnostic trouble codes
-./obdc dtc
-
-# Show capabilities (what can be read/controlled)
-./obdc capabilities
-
-# Start web dashboard
-./obdc web --port 5000
+```
+┌─────────────────────────────────────────┐
+│           FastAPI + WebSocket           │
+│    (uvicorn, ~50MB RAM, single proc)    │
+├─────────────────────────────────────────┤
+│  OBD Reader (background async task)     │
+│  - Reads key sensors at 2Hz             │
+│  - Logs all sensors to SQLite           │
+│  - Broadcasts via WebSocket             │
+├─────────────────────────────────────────┤
+│  SQLite (~/.local/share/obdc/obdc.db)   │
+│  - Time-series sensor data              │
+│  - Auto-managed, small footprint        │
+└─────────────────────────────────────────┘
 ```
 
-## Live Stream (for Agents)
+## API
 
-```bash
-./obdc live --interval 1
-```
+| Endpoint | Description |
+|----------|-------------|
+| `GET /` | Dashboard UI |
+| `GET /api/status` | Connection status |
+| `GET /api/sensors` | All sensor readings |
+| `GET /api/history/{sensor}` | Historical data |
+| `GET /api/dtc` | Diagnostic trouble codes |
+| `WS /ws` | Real-time sensor updates |
 
-Output (JSON lines):
+## WebSocket Protocol
+
+Connect to `ws://host:8000/ws` and receive JSON messages:
+
 ```json
-{"timestamp": "2026-03-15T19:24:38Z", "sensors": {"RPM": {"value": 2952.0, "unit": "revolutions_per_minute"}, "SPEED": {"value": 113.0, "unit": "kilometer_per_hour"}, ...}}
+{
+  "type": "sensor_update",
+  "timestamp": 1742062800.0,
+  "data": {
+    "RPM": {"value": 2500, "unit": "revolutions_per_minute"},
+    "SPEED": {"value": 100, "unit": "kilometer_per_hour"},
+    ...
+  }
+}
 ```
 
-Perfect for piping to jq, logging, or agent ingestion.
-
-## Web Dashboard
+## RPi4 Car Computer Setup
 
 ```bash
-./obdc web
+# Install
+cd ~/codeWS/Python/obd-dashboard
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+
+# Systemd service (auto-start)
+cp obdc.service ~/.config/systemd/user/
+systemctl --user enable --now obdc
+
+# Access at http://localhost:8000
 ```
 
-Then open http://localhost:5000 on your phone/computer.
+## Database
 
-## Capabilities Analysis
+All sensor data logged to `~/.local/share/obdc/obdc.db`
+
+Query recent history:
+```sql
+SELECT datetime(timestamp, 'unixepoch'), sensor, value 
+FROM sensor_data 
+WHERE sensor = 'RPM' 
+ORDER BY timestamp DESC LIMIT 100;
+```
+
+## History API
 
 ```bash
-./obdc capabilities
+# Get last 24h of RPM data
+curl http://localhost:8000/api/history/RPM?hours=24
+
+# Returns: [{"t": timestamp, "v": value}, ...]
 ```
-
-Shows:
-- Protocol (CAN, ISO, etc.)
-- Total supported sensors
-- Read-only sensors
-- Potentially writable commands (use with caution)
-
-## Safety
-
-**This tool is read-only by default.** OBD-II standard is primarily for diagnostics.
-
-Commands that could affect the vehicle (like `CLEAR_DTC`) are flagged in capabilities output but require explicit implementation to execute.
-
-## Tested Vehicles
-
-- 2021 Subaru Crosstrek (ISO 15765-4 CAN 11/500)
-- Should work with any OBD-II compliant vehicle (1996+)
 
 ## Hardware
 
-Works with any ELM327-compatible adapter:
-- USB adapters (recommended)
-- Bluetooth adapters
-- WiFi adapters
+- Any ELM327-compatible OBD adapter
+- USB recommended (most reliable)
+- Bluetooth/WiFi also work
 
 ## Requirements
 
 - Python 3.8+
-- ELM327 OBD-II adapter
-- Linux/macOS/Windows
+- FastAPI, uvicorn, websockets
+- obd (python-obd library)
+
+## Tested On
+
+- 2021 Subaru Crosstrek (ISO 15765-4 CAN 11/500)
+- Any OBD-II vehicle (1996+)
+
+## License
+
+MIT

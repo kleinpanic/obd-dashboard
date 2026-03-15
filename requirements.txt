@@ -1,0 +1,6 @@
+obd
+fastapi
+uvicorn[standard]
+websockets
+flask
+flask-cors
