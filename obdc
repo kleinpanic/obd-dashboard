@@ -1,28 +1,6 @@
 #!/usr/bin/env python3
 """
-OBD Commander CLI - Full control over car computer system
-
-Commands:
-  obdc status              # Connection and vehicle info
-  obdc scan                # List all sensors with values
-  obdc get <sensor>        # Get single sensor value
-  obdc live                # Stream live data (JSON lines)
-  obdc vin                 # Get VIN
-  obdc dtc                 # Get diagnostic trouble codes
-  obdc capabilities        # Show what can be controlled
-  
-  obdc server start        # Start web server
-  obdc server stop         # Stop web server  
-  obdc server status       # Server status
-  obdc server restart      # Restart server
-  
-  obdc db query <sql>      # Query SQLite database
-  obdc db export           # Export all data as JSON
-  obdc db clear            # Clear database
-  obdc db stats            # Database statistics
-  
-  obdc log tail            # Tail recent sensor logs
-  obdc log follow          # Follow live updates
+OBD Commander CLI - Professional car computer interface
 """
 
 import sys
@@ -32,6 +10,7 @@ import sqlite3
 import time
 import os
 import signal
+import argparse
 from pathlib import Path
 from datetime import datetime, timedelta
 
@@ -47,6 +26,7 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DATA_DIR / "obdc.db"
 PID_FILE = DATA_DIR / "server.pid"
 LOG_FILE = DATA_DIR / "obdc.log"
+CONFIG_PATH = DATA_DIR / "config.json"
 SERVER_SCRIPT = Path(__file__).parent / "server.py"
 
 def get_connection():
@@ -63,6 +43,79 @@ def get_connection():
     except:
         pass
     return None
+
+# === Server Commands ===
+
+def cmd_server(args):
+    """Server management"""
+    if not args:
+        print(json.dumps({"error": "Usage: obdc server [start|stop|status|restart|headless]"}))
+        return
+    
+    subcmd = args[0]
+    
+    if subcmd == "start":
+        port = int(args[1]) if len(args) > 1 else 9000
+        venv_python = Path(__file__).parent / "venv/bin/python"
+        python = str(venv_python) if venv_python.exists() else sys.executable
+        
+        proc = subprocess.Popen(
+            [python, str(SERVER_SCRIPT), "--port", str(port)],
+            stdout=open(LOG_FILE, 'a'),
+            stderr=subprocess.STDOUT,
+            start_new_session=True
+        )
+        PID_FILE.write_text(str(proc.pid))
+        print(json.dumps({"status": "started", "pid": proc.pid, "port": port, "url": f"http://localhost:{port}"}))
+    
+    elif subcmd == "headless":
+        port = int(args[1]) if len(args) > 1 else 9000
+        interval = float(args[2]) if len(args) > 2 else 1.0
+        # Start in headless mode - no web UI, just logging
+        venv_python = Path(__file__).parent / "venv/bin/python"
+        python = str(venv_python) if venv_python.exists() else sys.executable
+        
+        proc = subprocess.Popen(
+            [python, str(SERVER_SCRIPT), "--port", str(port), "--headless"],
+            stdout=open(LOG_FILE, 'a'),
+            stderr=subprocess.STDOUT,
+            start_new_session=True
+        )
+        PID_FILE.write_text(str(proc.pid))
+        print(json.dumps({"status": "headless", "pid": proc.pid, "interval": interval}))
+    
+    elif subcmd == "stop":
+        if not PID_FILE.exists():
+            print(json.dumps({"error": "Server not running"}))
+            return
+        
+        pid = int(PID_FILE.read_text().strip())
+        try:
+            os.kill(pid, signal.SIGTERM)
+            PID_FILE.unlink()
+            print(json.dumps({"status": "stopped", "pid": pid}))
+        except OSError:
+            PID_FILE.unlink()
+            print(json.dumps({"error": "Process already dead"}))
+    
+    elif subcmd == "status":
+        if not PID_FILE.exists():
+            print(json.dumps({"running": False}))
+            return
+        
+        pid = int(PID_FILE.read_text().strip())
+        try:
+            os.kill(pid, 0)
+            print(json.dumps({"running": True, "pid": pid}))
+        except OSError:
+            print(json.dumps({"running": False, "stale_pid": pid}))
+    
+    elif subcmd == "restart":
+        cmd_server(["stop"])
+        time.sleep(1)
+        cmd_server(["start"] + args[1:])
+
+# === OBD Commands ===
 
 def cmd_status(args):
     """Show connection status"""
@@ -82,14 +135,13 @@ def cmd_status(args):
             pass
         conn.close()
     
-    # Server status
     if PID_FILE.exists():
         pid = int(PID_FILE.read_text().strip())
         try:
-            os.kill(pid, 0)  # Check if process exists
+            os.kill(pid, 0)
             result["server"] = {"running": True, "pid": pid}
         except OSError:
-            result["server"] = {"running": False, "stale_pid": pid}
+            result["server"] = {"running": False}
     else:
         result["server"] = {"running": False}
     
@@ -160,7 +212,7 @@ def cmd_live(args):
         print(json.dumps({"error": "Not connected"}))
         return
     
-    key_sensors = ['RPM', 'SPEED', 'COOLANT_TEMP', 'INTAKE_TEMP', 'THROTTLE_POS', 
+    key_sensors = ['RPM', 'SPEED', 'INTAKE_TEMP', 'THROTTLE_POS', 
                     'FUEL_LEVEL', 'ENGINE_LOAD', 'MAF', 'TIMING_ADVANCE']
     
     try:
@@ -246,65 +298,12 @@ def cmd_capabilities(args):
         "warning": "OBD-II is primarily read-only. Write commands require specific protocols."
     }, indent=2))
 
-# Server commands
-def cmd_server(args):
-    """Server management"""
-    if not args:
-        print(json.dumps({"error": "Usage: obdc server [start|stop|status|restart]"}))
-        return
-    
-    subcmd = args[0]
-    
-    if subcmd == "start":
-        port = int(args[1]) if len(args) > 1 else 8000
-        venv_python = Path(__file__).parent / "venv/bin/python"
-        python = str(venv_python) if venv_python.exists() else sys.executable
-        
-        proc = subprocess.Popen(
-            [python, str(SERVER_SCRIPT), "--port", str(port)],
-            stdout=open(LOG_FILE, 'a'),
-            stderr=subprocess.STDOUT,
-            start_new_session=True
-        )
-        PID_FILE.write_text(str(proc.pid))
-        print(json.dumps({"status": "started", "pid": proc.pid, "port": port, "url": f"http://localhost:{port}"}))
-    
-    elif subcmd == "stop":
-        if not PID_FILE.exists():
-            print(json.dumps({"error": "Server not running"}))
-            return
-        
-        pid = int(PID_FILE.read_text().strip())
-        try:
-            os.kill(pid, signal.SIGTERM)
-            PID_FILE.unlink()
-            print(json.dumps({"status": "stopped", "pid": pid}))
-        except OSError:
-            PID_FILE.unlink()
-            print(json.dumps({"error": "Process already dead"}))
-    
-    elif subcmd == "status":
-        if not PID_FILE.exists():
-            print(json.dumps({"running": False}))
-            return
-        
-        pid = int(PID_FILE.read_text().strip())
-        try:
-            os.kill(pid, 0)
-            print(json.dumps({"running": True, "pid": pid}))
-        except OSError:
-            print(json.dumps({"running": False, "stale_pid": pid}))
-    
-    elif subcmd == "restart":
-        cmd_server(["stop"])
-        time.sleep(1)
-        cmd_server(["start"] + args[1:])
+# === Database Commands ===
 
-# Database commands
 def cmd_db(args):
     """Database management"""
     if not args:
-        print(json.dumps({"error": "Usage: obdc db [query|export|clear|stats]"}))
+        print(json.dumps({"error": "Usage: obdc db [query|export|clear|stats|sessions]"}))
         return
     
     subcmd = args[0]
@@ -330,21 +329,48 @@ def cmd_db(args):
             conn.close()
     
     elif subcmd == "export":
+        fmt = args[1] if len(args) > 1 else "json"
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
-        c.execute("SELECT timestamp, sensor, value, unit FROM sensor_data ORDER BY timestamp")
+        c.execute("SELECT timestamp, session_id, sensor, value, unit FROM sensor_data ORDER BY timestamp")
         rows = c.fetchall()
         conn.close()
         
-        data = [{
-            "timestamp": r[0],
-            "datetime": datetime.utcfromtimestamp(r[0]).isoformat(),
-            "sensor": r[1],
-            "value": r[2],
-            "unit": r[3]
-        } for r in rows]
+        if fmt == "csv":
+            print("timestamp,session_id,sensor,value,unit")
+            for r in rows:
+                print(f"{r[0]},{r[1]},{r[2]},{r[3]},{r[4]}")
+        else:
+            data = [{
+                "timestamp": r[0],
+                "datetime": datetime.utcfromtimestamp(r[0]).isoformat(),
+                "session_id": r[1],
+                "sensor": r[2],
+                "value": r[3],
+                "unit": r[4]
+            } for r in rows]
+            print(json.dumps(data, indent=2))
+    
+    elif subcmd == "sessions":
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('''
+            SELECT id, start_time, end_time, max_rpm, max_speed 
+            FROM sessions 
+            ORDER BY start_time DESC 
+            LIMIT 20
+        ''')
+        rows = c.fetchall()
+        conn.close()
         
-        print(json.dumps(data, indent=2))
+        sessions = [{
+            "id": r[0][:8],
+            "start": datetime.utcfromtimestamp(r[1]).isoformat() if r[1] else None,
+            "end": datetime.utcfromtimestamp(r[2]).isoformat() if r[2] else None,
+            "max_rpm": r[3],
+            "max_speed": r[4]
+        } for r in rows]
+        print(json.dumps({"sessions": sessions}, indent=2))
     
     elif subcmd == "clear":
         conn = sqlite3.connect(DB_PATH)
@@ -362,6 +388,8 @@ def cmd_db(args):
         total = c.fetchone()[0]
         c.execute("SELECT COUNT(DISTINCT sensor) FROM sensor_data")
         sensors = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM sessions")
+        sessions = c.fetchone()[0]
         c.execute("SELECT MIN(timestamp), MAX(timestamp) FROM sensor_data")
         time_range = c.fetchone()
         conn.close()
@@ -369,13 +397,15 @@ def cmd_db(args):
         print(json.dumps({
             "total_readings": total,
             "unique_sensors": sensors,
+            "total_sessions": sessions,
             "time_range": {
                 "start": datetime.utcfromtimestamp(time_range[0]).isoformat() if time_range[0] else None,
                 "end": datetime.utcfromtimestamp(time_range[1]).isoformat() if time_range[1] else None
             }
         }, indent=2))
 
-# Log commands
+# === Log Commands ===
+
 def cmd_log(args):
     """Log management"""
     if not args:
@@ -397,6 +427,67 @@ def cmd_log(args):
             subprocess.run(["tail", "-f", str(LOG_FILE)])
         else:
             print(json.dumps({"error": "No log file"}))
+
+# === MCP Commands ===
+
+def cmd_mcp(args):
+    """MCP server management"""
+    if not args:
+        print(json.dumps({"error": "Usage: obdc mcp [start|tools]"}))
+        return
+    
+    subcmd = args[0]
+    
+    if subcmd == "start":
+        # Start MCP server for AI assistant integration
+        print(json.dumps({
+            "info": "MCP server mode - communicate via stdin/stdout",
+            "tools": [
+                "obdc_get_status",
+                "obdc_get_sensors", 
+                "obdc_get_sensor_history",
+                "obdc_get_dtc",
+                "obdc_stream_live"
+            ]
+        }))
+        # In real implementation, this would start MCP protocol handler
+        # For now, just document the available tools
+    
+    elif subcmd == "tools":
+        print(json.dumps({
+            "tools": [
+                {
+                    "name": "obdc_get_status",
+                    "description": "Get OBD connection status and vehicle info",
+                    "parameters": {}
+                },
+                {
+                    "name": "obdc_get_sensors",
+                    "description": "Get all current sensor readings",
+                    "parameters": {}
+                },
+                {
+                    "name": "obdc_get_sensor_history",
+                    "description": "Get historical data for a sensor",
+                    "parameters": {
+                        "sensor": "Sensor name (e.g., RPM, SPEED)",
+                        "minutes": "Time range in minutes (default: 30)"
+                    }
+                },
+                {
+                    "name": "obdc_get_dtc",
+                    "description": "Get diagnostic trouble codes",
+                    "parameters": {}
+                },
+                {
+                    "name": "obdc_stream_live",
+                    "description": "Stream live sensor data",
+                    "parameters": {
+                        "interval": "Update interval in seconds (default: 1.0)"
+                    }
+                }
+            ]
+        }, indent=2))
 
 def print_help():
     print(__doc__)
@@ -422,6 +513,7 @@ def main():
         "server": cmd_server,
         "db": cmd_db,
         "log": cmd_log,
+        "mcp": cmd_mcp,
         "help": lambda _: print_help(),
     }
     
