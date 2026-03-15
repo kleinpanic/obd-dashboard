@@ -578,6 +578,7 @@ DASHBOARD_HTML = '''
             background: var(--card);
             border: 1px solid var(--border);
             border-radius: 16px;
+            overflow: hidden;
         }
         
         .gauge-svg {
@@ -608,6 +609,31 @@ DASHBOARD_HTML = '''
             color: var(--muted);
             text-transform: uppercase;
             letter-spacing: 1px;
+        }
+        
+        /* Tooltips */
+        [data-tooltip] {
+            position: relative;
+        }
+        
+        [data-tooltip]:hover::after {
+            content: attr(data-tooltip);
+            position: absolute;
+            bottom: 100%;
+            left: 50%;
+            transform: translateX(-50%);
+            background: var(--card);
+            border: 1px solid var(--border);
+            padding: 6px 10px;
+            border-radius: 6px;
+            font-size: 11px;
+            white-space: nowrap;
+            z-index: 100;
+            color: var(--text);
+        }
+        
+        .stat[data-tooltip]:hover::after {
+            margin-bottom: 4px;
         }
         
         .stats-grid {
@@ -985,40 +1011,40 @@ DASHBOARD_HTML = '''
                     </div>
                     
                     <div class="stats-grid">
-                        <div class="stat">
+                        <div class="stat" data-tooltip="Air temperature entering the engine">
                             <div class="stat-value" id="intake-value">--</div>
-                            <div class="stat-label">Intake °</div>
+                            <div class="stat-label" id="intake-label">Intake °C</div>
                         </div>
-                        <div class="stat">
+                        <div class="stat" data-tooltip="How hard the engine is working (0-100%)">
                             <div class="stat-value" id="load-value">--</div>
                             <div class="stat-label">Load %</div>
                         </div>
-                        <div class="stat">
+                        <div class="stat" data-tooltip="Throttle plate opening percentage">
                             <div class="stat-value" id="throttle-value">--</div>
                             <div class="stat-label">Throttle %</div>
                         </div>
-                        <div class="stat">
+                        <div class="stat" data-tooltip="Ignition timing advance/retard">
                             <div class="stat-value" id="timing-value">--</div>
                             <div class="stat-label">Timing °</div>
                         </div>
                     </div>
                     
                     <div class="secondary-stats">
-                        <div class="stat stat-large">
+                        <div class="stat stat-large" data-tooltip="Remaining fuel in tank">
                             <div class="stat-value" id="fuel-value">--</div>
                             <div class="stat-label">Fuel %</div>
                         </div>
-                        <div class="stat stat-large">
+                        <div class="stat stat-large" data-tooltip="Mass air flow rate into engine">
                             <div class="stat-value" id="maf-value">--</div>
                             <div class="stat-label">MAF g/s</div>
                         </div>
-                        <div class="stat stat-large">
+                        <div class="stat stat-large" data-tooltip="Vehicle electrical system voltage">
                             <div class="stat-value" id="voltage-value">--</div>
                             <div class="stat-label">Voltage V</div>
                         </div>
-                        <div class="stat stat-large">
+                        <div class="stat stat-large" data-tooltip="Engine oil temperature">
                             <div class="stat-value" id="oil-value">--</div>
-                            <div class="stat-label">Oil °</div>
+                            <div class="stat-label" id="oil-label">Oil °C</div>
                         </div>
                     </div>
                     
@@ -1240,22 +1266,31 @@ DASHBOARD_HTML = '''
             const svg = document.getElementById(svgId);
             if (!svg) return;
             
-            const percent = Math.min(value / max, 1);
+            const percent = Math.min(Math.max(value / max, 0), 1);
             const startAngle = -135;
             const endAngle = startAngle + (270 * percent);
+            const cx = 100, cy = 100, r = 75;
             
-            const cx = 100, cy = 100, r = 80;
-            const start = polarToCartesian(cx, cy, r, endAngle);
-            const end = polarToCartesian(cx, cy, r, startAngle);
-            const largeArc = percent > 0.5 ? 1 : 0;
+            // Create background arc (full)
+            const bgPath = describeArc(cx, cy, r, -135, 135);
             
-            const path = `M ${start.x} ${start.y} A ${r} ${r} 0 ${largeArc} 0 ${end.x} ${end.y}`;
+            // Create value arc
+            const valPath = describeArc(cx, cy, r, -135, endAngle);
             
             svg.innerHTML = `
-                <path d="M ${polarToCartesian(cx,cy,r,-135).x} ${polarToCartesian(cx,cy,r,-135).y} A ${r} ${r} 0 1 0 ${polarToCartesian(cx,cy,r,135).x} ${polarToCartesian(cx,cy,r,135).y}" 
-                      fill="none" stroke="#1a1a1a" stroke-width="12" stroke-linecap="round"/>
-                <path d="${path}" fill="none" stroke="${color}" stroke-width="12" stroke-linecap="round"/>
+                <path d="${bgPath}" fill="none" stroke="#1a1a1a" stroke-width="10" stroke-linecap="round"/>
+                <path d="${valPath}" fill="none" stroke="${color}" stroke-width="10" stroke-linecap="round"/>
             `;
+        }
+        
+        function describeArc(x, y, radius, startAngle, endAngle) {
+            const start = polarToCartesian(x, y, radius, endAngle);
+            const end = polarToCartesian(x, y, radius, startAngle);
+            const largeArcFlag = endAngle - startAngle <= 180 ? "0" : "1";
+            return [
+                "M", start.x, start.y,
+                "A", radius, radius, 0, largeArcFlag, 0, end.x, end.y
+            ].join(" ");
         }
         
         function polarToCartesian(cx, cy, r, angle) {
@@ -1307,6 +1342,8 @@ DASHBOARD_HTML = '''
         
         // Update UI
         function updateUI() {
+            const unitC = config.units === 'metric' ? '°C' : '°F';
+            
             const rpm = data.RPM?.value || 0;
             const rpmEl = document.getElementById('rpm-value');
             rpmEl.textContent = Math.round(rpm).toLocaleString();
@@ -1321,7 +1358,10 @@ DASHBOARD_HTML = '''
             
             const format = (v, u) => v !== undefined ? `${Math.round(v)}${u}` : '--';
             
-            document.getElementById('intake-value').textContent = format(convertTemp(data.INTAKE_TEMP?.value), '°');
+            const intakeTemp = data.INTAKE_TEMP?.value;
+            document.getElementById('intake-value').textContent = format(convertTemp(intakeTemp), '');
+            document.getElementById('intake-label').textContent = `Intake ${unitC}`;
+            
             document.getElementById('load-value').textContent = format(data.ENGINE_LOAD?.value, '%');
             document.getElementById('throttle-value').textContent = format(data.THROTTLE_POS?.value, '%');
             document.getElementById('timing-value').textContent = format(data.TIMING_ADVANCE?.value, '°');
@@ -1333,18 +1373,38 @@ DASHBOARD_HTML = '''
             
             document.getElementById('maf-value').textContent = data.MAF?.value ? `${data.MAF.value.toFixed(1)}` : '--';
             document.getElementById('voltage-value').textContent = data.CONTROL_MODULE_VOLTAGE?.value ? `${data.CONTROL_MODULE_VOLTAGE.value.toFixed(1)}` : '--';
-            document.getElementById('oil-value').textContent = data.OIL_TEMP?.value ? `${Math.round(convertTemp(data.OIL_TEMP.value))}°` : '--';
+            
+            const oilTemp = data.OIL_TEMP?.value;
+            document.getElementById('oil-value').textContent = oilTemp ? Math.round(convertTemp(oilTemp)) : '--';
+            document.getElementById('oil-label').textContent = `Oil ${unitC}`;
             
             // Sensors list
             const grid = document.getElementById('sensors-grid');
             grid.innerHTML = Object.entries(data)
                 .filter(([k]) => !['RPM', 'SPEED'].includes(k))
                 .map(([name, val]) => `
-                    <div class="sensor-card" onclick="showSensorDetail('${name}')">
+                    <div class="sensor-card" onclick="showSensorDetail('${name}')" data-tooltip="${getSensorDescription(name)}">
                         <div class="sensor-name">${name.replace(/_/g, ' ')}</div>
                         <div class="sensor-value">${val.value.toFixed(1)}<span class="sensor-unit">${val.unit}</span></div>
                     </div>
                 `).join('');
+        }
+        
+        function getSensorDescription(name) {
+            const descriptions = {
+                'INTAKE_TEMP': 'Temperature of air entering engine',
+                'THROTTLE_POS': 'Throttle plate position',
+                'ENGINE_LOAD': 'Current engine load percentage',
+                'FUEL_LEVEL': 'Fuel tank level',
+                'MAF': 'Mass Air Flow sensor reading',
+                'TIMING_ADVANCE': 'Spark timing relative to TDC',
+                'CONTROL_MODULE_VOLTAGE': 'ECU supply voltage',
+                'BAROMETRIC_PRESSURE': 'Atmospheric pressure',
+                'OIL_TEMP': 'Engine oil temperature',
+                'FUEL_RATE': 'Fuel consumption rate',
+                'COMMANDED_EQUIV_RATIO': 'Target air-fuel ratio'
+            };
+            return descriptions[name] || 'Vehicle sensor data';
         }
         
         // Sensor detail modal
