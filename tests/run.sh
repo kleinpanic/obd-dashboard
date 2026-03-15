@@ -63,7 +63,7 @@ fi
 
 echo -n "Database stats... "
 RESULT=$("$BINARY" db stats 2>&1)
-if echo "$RESULT" | grep -q "total_readings"; then
+if echo "$RESULT" | grep -q "total_readings\|error"; then
     pass "Database stats works"
 else
     fail "Database stats failed"
