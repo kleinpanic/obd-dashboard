@@ -82,6 +82,7 @@ class OBDManager:
         self.connected = False
         self.supported = []
         self.lock = threading.Lock()
+        self.last_data = {}  # Cache last good readings
         
     def connect(self):
         if not OBD_AVAILABLE:
@@ -94,19 +95,39 @@ class OBDManager:
             if self.connection.is_connected():
                 self.connected = True
                 self.supported = list(self.connection.supported_commands)
+                self.last_data = {}
                 return True
-        except:
-            pass
+        except Exception as e:
+            print(f"OBD connect error: {e}")
         return False
     
     def disconnect(self):
         if self.connection:
-            self.connection.close()
+            try:
+                self.connection.close()
+            except:
+                pass
             self.connected = False
+    
+    def is_healthy(self):
+        """Check if connection is still good"""
+        if not self.connection or not self.connected:
+            return False
+        try:
+            # Quick ping - try to read status
+            return self.connection.is_connected()
+        except:
+            return False
     
     def read_key_sensors(self):
         if not self.connected:
             return {}
+        
+        if not self.is_healthy():
+            print("OBD connection lost, attempting reconnect...")
+            self.disconnect()
+            if not self.connect():
+                return {}
         
         key_pids = ['RPM', 'SPEED', 'COOLANT_TEMP', 'INTAKE_TEMP', 'THROTTLE_POS', 
                     'FUEL_LEVEL', 'ENGINE_LOAD', 'MAF', 'TIMING_ADVANCE',
@@ -125,8 +146,15 @@ class OBDManager:
                                 unit = str(val.units) if hasattr(val, 'units') else ""
                                 data[cmd.name] = {"value": value, "unit": unit}
                                 log_sensor(cmd.name, value, unit)
-                    except:
+                                self.last_data[cmd.name] = data[cmd.name]
+                    except Exception as e:
                         pass
+        
+        # Merge with last known good data for stability
+        for k, v in self.last_data.items():
+            if k not in data:
+                data[k] = v
+        
         return data
     
     def read_all(self):
@@ -195,15 +223,34 @@ ws_manager = ConnectionManager()
 
 # Background OBD reader
 async def obd_reader():
+    consecutive_failures = 0
     while True:
         if obd_manager.connected and ws_manager.active_connections:
-            data = obd_manager.read_key_sensors()
-            if data:
-                await ws_manager.broadcast({
-                    "type": "sensor_update",
-                    "timestamp": time.time(),
-                    "data": data
-                })
+            try:
+                data = obd_manager.read_key_sensors()
+                if data:
+                    await ws_manager.broadcast({
+                        "type": "sensor_update",
+                        "timestamp": time.time(),
+                        "data": data
+                    })
+                    consecutive_failures = 0
+                else:
+                    consecutive_failures += 1
+                    if consecutive_failures > 5:
+                        print("Too many failures, reconnecting...")
+                        obd_manager.disconnect()
+                        await asyncio.sleep(1)
+                        obd_manager.connect()
+                        consecutive_failures = 0
+            except Exception as e:
+                print(f"OBD reader error: {e}")
+                consecutive_failures += 1
+        elif not obd_manager.connected and ws_manager.active_connections:
+            # Try to reconnect if we have clients but no OBD
+            print("Attempting OBD reconnect...")
+            obd_manager.connect()
+        
         await asyncio.sleep(0.25)  # 4Hz for smooth gauges
 
 # Lifespan context manager
