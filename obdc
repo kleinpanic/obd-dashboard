@@ -1,459 +1,435 @@
 #!/usr/bin/env python3
 """
-OBD Commander - CLI and web interface for OBD-II vehicles
-Agent-friendly output (JSON) + human dashboard.
+OBD Commander CLI - Full control over car computer system
 
-Usage:
-  obdc status              # Connection status and vehicle info
-  obdc scan                # List all supported sensors
-  obdc live                # Stream live data to stdout (JSON lines)
+Commands:
+  obdc status              # Connection and vehicle info
+  obdc scan                # List all sensors with values
   obdc get <sensor>        # Get single sensor value
+  obdc live                # Stream live data (JSON lines)
   obdc vin                 # Get VIN
   obdc dtc                 # Get diagnostic trouble codes
-  obdc web [--port 5000]   # Start web dashboard
-  obdc capabilities        # Show what can be controlled (read-only analysis)
+  obdc capabilities        # Show what can be controlled
+  
+  obdc server start        # Start web server
+  obdc server stop         # Stop web server  
+  obdc server status       # Server status
+  obdc server restart      # Restart server
+  
+  obdc db query <sql>      # Query SQLite database
+  obdc db export           # Export all data as JSON
+  obdc db clear            # Clear database
+  obdc db stats            # Database statistics
+  
+  obdc log tail            # Tail recent sensor logs
+  obdc log follow          # Follow live updates
 """
 
-import obd
-import json
 import sys
-import argparse
-import threading
+import json
+import subprocess
+import sqlite3
 import time
-from datetime import datetime
+import os
+import signal
+from pathlib import Path
+from datetime import datetime, timedelta
 
-# Flask imports (optional, for web mode)
 try:
-    from flask import Flask, jsonify, render_template_string
-    FLASK_AVAILABLE = True
+    import obd
+    OBD_AVAILABLE = True
 except ImportError:
-    FLASK_AVAILABLE = False
+    OBD_AVAILABLE = False
 
-class OBDCommander:
-    def __init__(self, port=None):
-        self.connection = None
-        self.port = port or self._auto_detect()
-        
-    def _auto_detect(self):
-        ports = obd.scan_serial()
-        return ports[0] if ports else None
-    
-    def connect(self):
-        if not self.port:
-            return False
-        # Try all protocols, prefer CAN protocols for modern vehicles
-        for proto in ["6", "7", "AUTO", "3"]:  # CAN 11/500, CAN 29/500, AUTO, ISO 9141
-            try:
-                self.connection = obd.OBD(self.port, protocol=proto, fast=False)
-                if self.connection.is_connected():
-                    return True
-            except:
-                continue
-        return False
-    
-    def disconnect(self):
-        if self.connection:
-            self.connection.close()
-    
-    @property
-    def is_connected(self):
-        return self.connection and self.connection.is_connected()
-    
-    def get_vin(self):
-        """Get Vehicle Identification Number"""
-        if not self.is_connected:
-            return None
-        
-        # VIN is mode 09, PID 02
-        response = self.connection.query(obd.commands.VIN)
-        if not response.is_null():
-            return str(response.value)
+# Paths
+DATA_DIR = Path.home() / ".local/share/obdc"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+DB_PATH = DATA_DIR / "obdc.db"
+PID_FILE = DATA_DIR / "server.pid"
+LOG_FILE = DATA_DIR / "obdc.log"
+SERVER_SCRIPT = Path(__file__).parent / "server.py"
+
+def get_connection():
+    """Get OBD connection"""
+    if not OBD_AVAILABLE:
         return None
-    
-    def get_dtc(self):
-        """Get Diagnostic Trouble Codes"""
-        if not self.is_connected:
-            return []
-        
-        dtcs = []
-        # Get current DTCs
-        response = self.connection.query(obd.commands.GET_DTC)
-        if not response.is_null():
-            dtcs = [(code, desc) for code, desc in response.value]
-        
-        # Also check pending
-        response = self.connection.query(obd.commands.GET_CURRENT_DTC)
-        if not response.is_null():
-            dtcs.extend([(code, desc) for code, desc in response.value])
-        
-        return list(set(dtcs))  # Dedupe
-    
-    def get_all_sensors(self):
-        """Get all supported sensors with current values"""
-        if not self.is_connected:
-            return {}
-        
-        sensors = {}
-        for cmd in self.connection.supported_commands:
-            try:
-                response = self.connection.query(cmd)
-                if not response.is_null():
-                    val = response.value
-                    sensors[cmd.name] = {
-                        "pid": cmd.pid,
-                        "value": float(val.magnitude) if hasattr(val, 'magnitude') and isinstance(val.magnitude, (int, float)) else str(val),
-                        "unit": str(val.units) if hasattr(val, 'units') else "",
-                    }
-            except Exception as e:
-                pass
-        
-        return sensors
-    
-    def get_sensor(self, name):
-        """Get single sensor by name"""
-        if not self.is_connected:
-            return None
-        
-        # Find command by name
-        for cmd in self.connection.supported_commands:
-            if cmd.name == name.upper():
-                response = self.connection.query(cmd)
-                if not response.is_null():
-                    val = response.value
-                    return {
-                        "name": cmd.name,
-                        "pid": cmd.pid,
-                        "value": float(val.magnitude) if hasattr(val, 'magnitude') and isinstance(val.magnitude, (int, float)) else str(val),
-                        "unit": str(val.units) if hasattr(val, 'units') else "",
-                    }
+    ports = obd.scan_serial()
+    if not ports:
         return None
+    try:
+        conn = obd.OBD(ports[0], protocol="6", fast=False)
+        if conn.is_connected():
+            return conn
+    except:
+        pass
+    return None
+
+def cmd_status(args):
+    """Show connection status"""
+    result = {"connected": False, "vehicle": None}
     
-    def get_capabilities(self):
-        """Analyze what can be read vs controlled"""
-        if not self.is_connected:
-            return {}
+    conn = get_connection()
+    if conn:
+        result["connected"] = True
+        result["protocol"] = conn.protocol_name()
+        result["sensors_supported"] = len(conn.supported_commands)
         
-        supported = [cmd.name for cmd in self.connection.supported_commands]
-        
-        # Categories
-        read_only = []
-        potentially_writable = []
-        
-        # Standard OBD-II is mostly read-only, but some PIDs can be used for tests
-        # This is a safe classification
-        
-        for name in supported:
-            if any(x in name for x in ['CONTROL', 'TEST', 'CLEAR']):
-                potentially_writable.append(name)
+        try:
+            vin = conn.query(obd.commands.VIN)
+            if not vin.is_null():
+                result["vehicle"] = {"vin": str(vin.value)}
+        except:
+            pass
+        conn.close()
+    
+    # Server status
+    if PID_FILE.exists():
+        pid = int(PID_FILE.read_text().strip())
+        try:
+            os.kill(pid, 0)  # Check if process exists
+            result["server"] = {"running": True, "pid": pid}
+        except OSError:
+            result["server"] = {"running": False, "stale_pid": pid}
+    else:
+        result["server"] = {"running": False}
+    
+    print(json.dumps(result, indent=2))
+
+def cmd_scan(args):
+    """Scan all sensors"""
+    conn = get_connection()
+    if not conn:
+        print(json.dumps({"error": "Not connected"}))
+        return
+    
+    sensors = {}
+    for cmd in conn.supported_commands:
+        try:
+            resp = conn.query(cmd)
+            if not resp.is_null():
+                val = resp.value
+                sensors[cmd.name] = {
+                    "pid": cmd.pid,
+                    "value": float(val.magnitude) if hasattr(val, 'magnitude') and isinstance(val.magnitude, (int, float)) else str(val),
+                    "unit": str(val.units) if hasattr(val, 'units') else "",
+                }
+        except:
+            pass
+    
+    conn.close()
+    print(json.dumps({"sensors": sensors, "count": len(sensors)}, indent=2))
+
+def cmd_get(args):
+    """Get single sensor"""
+    if len(args) < 1:
+        print(json.dumps({"error": "Usage: obdc get <sensor_name>"}))
+        return
+    
+    conn = get_connection()
+    if not conn:
+        print(json.dumps({"error": "Not connected"}))
+        return
+    
+    sensor_name = args[0].upper()
+    for cmd in conn.supported_commands:
+        if cmd.name == sensor_name:
+            resp = conn.query(cmd)
+            conn.close()
+            if not resp.is_null():
+                val = resp.value
+                print(json.dumps({
+                    "name": cmd.name,
+                    "pid": cmd.pid,
+                    "value": float(val.magnitude) if hasattr(val, 'magnitude') and isinstance(val.magnitude, (int, float)) else str(val),
+                    "unit": str(val.units) if hasattr(val, 'units') else "",
+                }, indent=2))
+                return
             else:
-                read_only.append(name)
-        
-        return {
-            "protocol": self.connection.protocol_name(),
-            "total_supported": len(supported),
-            "read_only": read_only,
-            "potentially_writable": potentially_writable,
-            "warning": "OBD-II standard is primarily read-only. Write commands require specific protocols and can affect vehicle operation. Use with extreme caution.",
-        }
+                print(json.dumps({"error": "No data"}))
+                return
     
-    def stream_live(self, interval=1.0):
-        """Stream live data as JSON lines (for agents)"""
-        if not self.is_connected:
-            return
-        
-        key_sensors = [
-            obd.commands.RPM,
-            obd.commands.SPEED,
-            obd.commands.COOLANT_TEMP,
-            obd.commands.INTAKE_TEMP,
-            obd.commands.THROTTLE_POS,
-            obd.commands.FUEL_LEVEL,
-            obd.commands.ENGINE_LOAD,
-            obd.commands.MAF,
-            obd.commands.TIMING_ADVANCE,
-        ]
-        
+    conn.close()
+    print(json.dumps({"error": f"Sensor {sensor_name} not found"}))
+
+def cmd_live(args):
+    """Stream live data"""
+    interval = float(args[0]) if args else 1.0
+    
+    conn = get_connection()
+    if not conn:
+        print(json.dumps({"error": "Not connected"}))
+        return
+    
+    key_sensors = ['RPM', 'SPEED', 'COOLANT_TEMP', 'INTAKE_TEMP', 'THROTTLE_POS', 
+                    'FUEL_LEVEL', 'ENGINE_LOAD', 'MAF', 'TIMING_ADVANCE']
+    
+    try:
         while True:
-            data = {
-                "timestamp": datetime.utcnow().isoformat() + "Z",
-                "sensors": {}
-            }
-            
-            for cmd in key_sensors:
-                if cmd in self.connection.supported_commands:
+            data = {"timestamp": datetime.utcnow().isoformat() + "Z", "sensors": {}}
+            for cmd in conn.supported_commands:
+                if cmd.name in key_sensors:
                     try:
-                        response = self.connection.query(cmd)
-                        if not response.is_null():
-                            val = response.value
+                        resp = conn.query(cmd)
+                        if not resp.is_null():
+                            val = resp.value
                             data["sensors"][cmd.name] = {
                                 "value": float(val.magnitude) if hasattr(val, 'magnitude') else str(val),
                                 "unit": str(val.units) if hasattr(val, 'units') else "",
                             }
                     except:
                         pass
-            
             print(json.dumps(data), flush=True)
             time.sleep(interval)
-
-
-def cmd_status(args):
-    """Show connection status"""
-    cmdr = OBDCommander()
-    
-    result = {
-        "port": cmdr.port,
-        "connected": False,
-        "vehicle": None,
-    }
-    
-    if cmdr.connect():
-        result["connected"] = True
-        result["protocol"] = cmdr.connection.protocol_name()
-        result["sensors_supported"] = len(cmdr.connection.supported_commands)
-        
-        vin = cmdr.get_vin()
-        if vin:
-            result["vehicle"] = {"vin": vin}
-        
-        cmdr.disconnect()
-    
-    print(json.dumps(result, indent=2))
-
+    except KeyboardInterrupt:
+        pass
+    finally:
+        conn.close()
 
 def cmd_vin(args):
     """Get VIN"""
-    cmdr = OBDCommander()
-    
-    if not cmdr.connect():
-        print(json.dumps({"error": "Not connected"}))
-        return
-    
-    vin = cmdr.get_vin()
-    cmdr.disconnect()
-    
-    print(json.dumps({"vin": vin}, indent=2))
-
-
-def cmd_scan(args):
-    """Scan all supported sensors"""
-    cmdr = OBDCommander()
-    
-    if not cmdr.connect():
-        print(json.dumps({"error": "Not connected"}))
-        return
-    
-    sensors = cmdr.get_all_sensors()
-    cmdr.disconnect()
-    
-    print(json.dumps({"sensors": sensors}, indent=2))
-
-
-def cmd_get(args):
-    """Get single sensor value"""
-    cmdr = OBDCommander()
-    
-    if not cmdr.connect():
-        print(json.dumps({"error": "Not connected"}))
-        return
-    
-    sensor = cmdr.get_sensor(args.sensor)
-    cmdr.disconnect()
-    
-    print(json.dumps(sensor, indent=2) if sensor else json.dumps({"error": "Sensor not found"}))
-
-
-def cmd_live(args):
-    """Stream live data"""
-    cmdr = OBDCommander()
-    
-    if not cmdr.connect():
+    conn = get_connection()
+    if not conn:
         print(json.dumps({"error": "Not connected"}))
         return
     
     try:
-        cmdr.stream_live(interval=args.interval)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        cmdr.disconnect()
-
+        vin = conn.query(obd.commands.VIN)
+        conn.close()
+        if not vin.is_null():
+            print(json.dumps({"vin": str(vin.value)}, indent=2))
+        else:
+            print(json.dumps({"error": "VIN not available"}))
+    except Exception as e:
+        conn.close()
+        print(json.dumps({"error": str(e)}))
 
 def cmd_dtc(args):
-    """Get diagnostic trouble codes"""
-    cmdr = OBDCommander()
-    
-    if not cmdr.connect():
+    """Get DTCs"""
+    conn = get_connection()
+    if not conn:
         print(json.dumps({"error": "Not connected"}))
         return
     
-    dtcs = cmdr.get_dtc()
-    cmdr.disconnect()
-    
+    dtcs = []
+    try:
+        resp = conn.query(obd.commands.GET_DTC)
+        if not resp.is_null():
+            dtcs = [(code, desc) for code, desc in resp.value]
+    except:
+        pass
+    conn.close()
     print(json.dumps({"dtc": dtcs, "count": len(dtcs)}, indent=2))
 
-
 def cmd_capabilities(args):
-    """Show what can be controlled"""
-    cmdr = OBDCommander()
-    
-    if not cmdr.connect():
+    """Show capabilities"""
+    conn = get_connection()
+    if not conn:
         print(json.dumps({"error": "Not connected"}))
         return
     
-    caps = cmdr.get_capabilities()
-    cmdr.disconnect()
+    supported = [cmd.name for cmd in conn.supported_commands]
+    read_only = []
+    writable = []
     
-    print(json.dumps(caps, indent=2))
+    for name in supported:
+        if any(x in name for x in ['CONTROL', 'TEST', 'CLEAR']):
+            writable.append(name)
+        else:
+            read_only.append(name)
+    
+    conn.close()
+    print(json.dumps({
+        "protocol": conn.protocol_name(),
+        "total_supported": len(supported),
+        "read_only": read_only,
+        "potentially_writable": writable,
+        "warning": "OBD-II is primarily read-only. Write commands require specific protocols."
+    }, indent=2))
 
-
-def cmd_web(args):
-    """Start web dashboard"""
-    if not FLASK_AVAILABLE:
-        print(json.dumps({"error": "Flask not installed. Run: pip install flask flask-cors"}))
+# Server commands
+def cmd_server(args):
+    """Server management"""
+    if not args:
+        print(json.dumps({"error": "Usage: obdc server [start|stop|status|restart]"}))
         return
     
-    cmdr = OBDCommander()
+    subcmd = args[0]
     
-    if not cmdr.connect():
-        print(json.dumps({"error": "Not connected"}))
-        return
-    
-    print(f"Starting web dashboard on port {args.port}...", file=sys.stderr)
-    
-    app = Flask(__name__)
-    live_data = {"data": {}, "connected": True}
-    
-    def update_loop():
-        while True:
-            live_data["data"] = cmdr.get_all_sensors()
-            time.sleep(0.5)
-    
-    updater = threading.Thread(target=update_loop, daemon=True)
-    updater.start()
-    
-    DASHBOARD_HTML = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>OBD Commander</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: system-ui; background: #0a0a0a; color: #fff; padding: 15px; }
-        h1 { font-size: 1.3em; margin-bottom: 15px; }
-        .gauges { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; margin-bottom: 20px; }
-        .gauge { background: #1a1a1a; border-radius: 8px; padding: 15px; text-align: center; }
-        .gauge-value { font-size: 2em; font-weight: bold; color: #4ade80; }
-        .gauge-unit { font-size: 0.8em; color: #666; }
-        .gauge-label { font-size: 0.85em; color: #888; margin-top: 5px; }
-        .sensors { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 8px; }
-        .sensor { background: #1a1a1a; padding: 10px 15px; border-radius: 6px; display: flex; justify-content: space-between; }
-        .sensor-name { color: #888; font-size: 0.9em; }
-        .sensor-value { color: #4ade80; font-weight: 500; }
-    </style>
-</head>
-<body>
-    <h1>OBD Commander</h1>
-    <div class="gauges" id="gauges"></div>
-    <div class="sensors" id="sensors"></div>
-    <script>
-        const priority = ['RPM', 'SPEED', 'COOLANT_TEMP', 'FUEL_LEVEL', 'ENGINE_LOAD', 'THROTTLE_POS', 'INTAKE_TEMP'];
+    if subcmd == "start":
+        port = int(args[1]) if len(args) > 1 else 8000
+        venv_python = Path(__file__).parent / "venv/bin/python"
+        python = str(venv_python) if venv_python.exists() else sys.executable
         
-        async function update() {
-            const res = await fetch('/api/data');
-            const data = await res.json();
-            
-            const gauges = document.getElementById('gauges');
-            const sensors = document.getElementById('sensors');
-            
-            let gaugeHtml = '';
-            let sensorHtml = '';
-            
-            for (const [name, val] of Object.entries(data.data)) {
-                const display = typeof val.value === 'number' ? val.value.toFixed(1) : val.value;
-                const html = `<div class="${priority.includes(name) ? 'gauge' : 'sensor'}">
-                    <div class="${priority.includes(name) ? 'gauge' : 'sensor'}-value">${display}</div>
-                    <div class="${priority.includes(name) ? 'gauge' : 'sensor'}-${priority.includes(name) ? 'unit' : 'name'}">${val.unit || ''}</div>
-                    ${priority.includes(name) ? `<div class="gauge-label">${name.replace(/_/g, ' ')}</div>` : `<span class="sensor-name">${name.replace(/_/g, ' ')}</span>`}
-                </div>`;
-                
-                if (priority.includes(name)) gaugeHtml += html;
-                else sensorHtml += html;
+        proc = subprocess.Popen(
+            [python, str(SERVER_SCRIPT), "--port", str(port)],
+            stdout=open(LOG_FILE, 'a'),
+            stderr=subprocess.STDOUT,
+            start_new_session=True
+        )
+        PID_FILE.write_text(str(proc.pid))
+        print(json.dumps({"status": "started", "pid": proc.pid, "port": port, "url": f"http://localhost:{port}"}))
+    
+    elif subcmd == "stop":
+        if not PID_FILE.exists():
+            print(json.dumps({"error": "Server not running"}))
+            return
+        
+        pid = int(PID_FILE.read_text().strip())
+        try:
+            os.kill(pid, signal.SIGTERM)
+            PID_FILE.unlink()
+            print(json.dumps({"status": "stopped", "pid": pid}))
+        except OSError:
+            PID_FILE.unlink()
+            print(json.dumps({"error": "Process already dead"}))
+    
+    elif subcmd == "status":
+        if not PID_FILE.exists():
+            print(json.dumps({"running": False}))
+            return
+        
+        pid = int(PID_FILE.read_text().strip())
+        try:
+            os.kill(pid, 0)
+            print(json.dumps({"running": True, "pid": pid}))
+        except OSError:
+            print(json.dumps({"running": False, "stale_pid": pid}))
+    
+    elif subcmd == "restart":
+        cmd_server(["stop"])
+        time.sleep(1)
+        cmd_server(["start"] + args[1:])
+
+# Database commands
+def cmd_db(args):
+    """Database management"""
+    if not args:
+        print(json.dumps({"error": "Usage: obdc db [query|export|clear|stats]"}))
+        return
+    
+    subcmd = args[0]
+    
+    if subcmd == "query":
+        if len(args) < 2:
+            print(json.dumps({"error": "Usage: obdc db query <sql>"}))
+            return
+        sql = " ".join(args[1:])
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            c = conn.cursor()
+            c.execute(sql)
+            if sql.upper().startswith("SELECT"):
+                rows = c.fetchall()
+                print(json.dumps({"rows": rows, "count": len(rows)}, indent=2))
+            else:
+                conn.commit()
+                print(json.dumps({"affected": c.rowcount}))
+        except Exception as e:
+            print(json.dumps({"error": str(e)}))
+        finally:
+            conn.close()
+    
+    elif subcmd == "export":
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT timestamp, sensor, value, unit FROM sensor_data ORDER BY timestamp")
+        rows = c.fetchall()
+        conn.close()
+        
+        data = [{
+            "timestamp": r[0],
+            "datetime": datetime.utcfromtimestamp(r[0]).isoformat(),
+            "sensor": r[1],
+            "value": r[2],
+            "unit": r[3]
+        } for r in rows]
+        
+        print(json.dumps(data, indent=2))
+    
+    elif subcmd == "clear":
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("DELETE FROM sensor_data")
+        conn.commit()
+        count = c.rowcount
+        conn.close()
+        print(json.dumps({"cleared": count}))
+    
+    elif subcmd == "stats":
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM sensor_data")
+        total = c.fetchone()[0]
+        c.execute("SELECT COUNT(DISTINCT sensor) FROM sensor_data")
+        sensors = c.fetchone()[0]
+        c.execute("SELECT MIN(timestamp), MAX(timestamp) FROM sensor_data")
+        time_range = c.fetchone()
+        conn.close()
+        
+        print(json.dumps({
+            "total_readings": total,
+            "unique_sensors": sensors,
+            "time_range": {
+                "start": datetime.utcfromtimestamp(time_range[0]).isoformat() if time_range[0] else None,
+                "end": datetime.utcfromtimestamp(time_range[1]).isoformat() if time_range[1] else None
             }
-            
-            gauges.innerHTML = gaugeHtml;
-            sensors.innerHTML = sensorHtml;
-        }
-        
-        setInterval(update, 1000);
-        update();
-    </script>
-</body>
-</html>
-"""
-    
-    @app.route('/')
-    def index():
-        return DASHBOARD_HTML
-    
-    @app.route('/api/data')
-    def api_data():
-        return jsonify(live_data)
-    
-    @app.route('/api/sensors')
-    def api_sensors():
-        return jsonify({"supported": [c.name for c in cmdr.connection.supported_commands]})
-    
-    app.run(host='0.0.0.0', port=args.port, debug=False)
+        }, indent=2))
 
+# Log commands
+def cmd_log(args):
+    """Log management"""
+    if not args:
+        print(json.dumps({"error": "Usage: obdc log [tail|follow]"}))
+        return
+    
+    subcmd = args[0]
+    
+    if subcmd == "tail":
+        lines = int(args[1]) if len(args) > 1 else 50
+        if LOG_FILE.exists():
+            result = subprocess.run(["tail", "-n", str(lines), str(LOG_FILE)], capture_output=True, text=True)
+            print(result.stdout)
+        else:
+            print(json.dumps({"error": "No log file"}))
+    
+    elif subcmd == "follow":
+        if LOG_FILE.exists():
+            subprocess.run(["tail", "-f", str(LOG_FILE)])
+        else:
+            print(json.dumps({"error": "No log file"}))
+
+def print_help():
+    print(__doc__)
 
 def main():
-    parser = argparse.ArgumentParser(description="OBD Commander - CLI for OBD-II vehicles")
-    subparsers = parser.add_subparsers(dest='command', help='Commands')
+    args = sys.argv[1:]
     
-    # status
-    p = subparsers.add_parser('status', help='Connection status')
-    p.set_defaults(func=cmd_status)
-    
-    # vin
-    p = subparsers.add_parser('vin', help='Get VIN')
-    p.set_defaults(func=cmd_vin)
-    
-    # scan
-    p = subparsers.add_parser('scan', help='Scan all sensors')
-    p.set_defaults(func=cmd_scan)
-    
-    # get
-    p = subparsers.add_parser('get', help='Get single sensor')
-    p.add_argument('sensor', help='Sensor name (e.g., RPM, SPEED)')
-    p.set_defaults(func=cmd_get)
-    
-    # live
-    p = subparsers.add_parser('live', help='Stream live data (JSON lines)')
-    p.add_argument('--interval', '-i', type=float, default=1.0, help='Update interval')
-    p.set_defaults(func=cmd_live)
-    
-    # dtc
-    p = subparsers.add_parser('dtc', help='Get diagnostic trouble codes')
-    p.set_defaults(func=cmd_dtc)
-    
-    # capabilities
-    p = subparsers.add_parser('capabilities', help='Show controllable features')
-    p.set_defaults(func=cmd_capabilities)
-    
-    # web
-    p = subparsers.add_parser('web', help='Start web dashboard')
-    p.add_argument('--port', '-p', type=int, default=5000)
-    p.set_defaults(func=cmd_web)
-    
-    args = parser.parse_args()
-    
-    if not args.command:
-        parser.print_help()
+    if not args:
+        print_help()
         return
     
-    args.func(args)
+    cmd = args[0]
+    rest = args[1:]
+    
+    commands = {
+        "status": cmd_status,
+        "scan": cmd_scan,
+        "get": cmd_get,
+        "live": cmd_live,
+        "vin": cmd_vin,
+        "dtc": cmd_dtc,
+        "capabilities": cmd_capabilities,
+        "server": cmd_server,
+        "db": cmd_db,
+        "log": cmd_log,
+        "help": lambda _: print_help(),
+    }
+    
+    if cmd in commands:
+        commands[cmd](rest)
+    else:
+        print(f"Unknown command: {cmd}")
+        print_help()
 
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
