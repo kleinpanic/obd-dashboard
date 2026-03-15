@@ -129,9 +129,10 @@ class OBDManager:
             if not self.connect():
                 return {}
         
-        key_pids = ['RPM', 'SPEED', 'COOLANT_TEMP', 'INTAKE_TEMP', 'THROTTLE_POS', 
+        key_pids = ['RPM', 'SPEED', 'INTAKE_TEMP', 'THROTTLE_POS', 
                     'FUEL_LEVEL', 'ENGINE_LOAD', 'MAF', 'TIMING_ADVANCE',
-                    'CONTROL_MODULE_VOLTAGE', 'FUEL_RATE', 'BAROMETRIC_PRESSURE']
+                    'CONTROL_MODULE_VOLTAGE', 'BAROMETRIC_PRESSURE', 'AMBIANT_AIR_TEMP',
+                    'OIL_TEMP', 'FUEL_RATE', 'COMMANDED_EQUIV_RATIO']
         
         data = {}
         with self.lock:
@@ -485,6 +486,32 @@ DASHBOARD_HTML = '''
         }
         
         /* Secondary Stats */
+        .history-stats {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 8px;
+            margin-top: 12px;
+            padding-top: 12px;
+            border-top: 1px solid var(--border);
+        }
+        
+        .history-stat {
+            text-align: center;
+        }
+        
+        .history-stat-value {
+            font-size: 16px;
+            font-weight: 500;
+            font-variant-numeric: tabular-nums;
+            color: var(--accent);
+        }
+        
+        .history-stat-label {
+            font-size: 10px;
+            color: var(--muted);
+            text-transform: uppercase;
+        }
+        
         .secondary-stats {
             display: grid;
             grid-template-columns: repeat(2, 1fr);
@@ -651,31 +678,39 @@ DASHBOARD_HTML = '''
                     
                     <div class="stats-grid">
                         <div class="stat">
-                            <div class="stat-value" id="coolant-value">--</div>
-                            <div class="stat-label">Coolant</div>
-                        </div>
-                        <div class="stat">
                             <div class="stat-value" id="intake-value">--</div>
-                            <div class="stat-label">Intake</div>
+                            <div class="stat-label">Intake °C</div>
                         </div>
                         <div class="stat">
                             <div class="stat-value" id="load-value">--</div>
-                            <div class="stat-label">Load</div>
+                            <div class="stat-label">Load %</div>
                         </div>
                         <div class="stat">
                             <div class="stat-value" id="throttle-value">--</div>
-                            <div class="stat-label">Throttle</div>
+                            <div class="stat-label">Throttle %</div>
+                        </div>
+                        <div class="stat">
+                            <div class="stat-value" id="timing-value">--</div>
+                            <div class="stat-label">Timing °</div>
                         </div>
                     </div>
                     
                     <div class="secondary-stats">
                         <div class="stat stat-large">
                             <div class="stat-value" id="fuel-value">--</div>
-                            <div class="stat-label">Fuel Level</div>
+                            <div class="stat-label">Fuel %</div>
                         </div>
                         <div class="stat stat-large">
                             <div class="stat-value" id="maf-value">--</div>
-                            <div class="stat-label">MAF</div>
+                            <div class="stat-label">MAF g/s</div>
+                        </div>
+                        <div class="stat stat-large">
+                            <div class="stat-value" id="voltage-value">--</div>
+                            <div class="stat-label">Voltage V</div>
+                        </div>
+                        <div class="stat stat-large">
+                            <div class="stat-value" id="oil-value">--</div>
+                            <div class="stat-label">Oil °C</div>
                         </div>
                     </div>
                 </div>
@@ -695,14 +730,22 @@ DASHBOARD_HTML = '''
                     <div class="chart-container">
                         <div class="chart-title">Speed (last 5 min)</div>
                         <div class="chart"><canvas id="speed-chart"></canvas></div>
+                        <div class="history-stats" id="speed-stats"></div>
                     </div>
                     <div class="chart-container">
                         <div class="chart-title">RPM (last 5 min)</div>
                         <div class="chart"><canvas id="rpm-chart"></canvas></div>
+                        <div class="history-stats" id="rpm-stats"></div>
                     </div>
                     <div class="chart-container">
                         <div class="chart-title">Engine Load (last 5 min)</div>
                         <div class="chart"><canvas id="load-chart"></canvas></div>
+                        <div class="history-stats" id="load-stats"></div>
+                    </div>
+                    <div class="chart-container">
+                        <div class="chart-title">Fuel Level (last 5 min)</div>
+                        <div class="chart"><canvas id="fuel-chart"></canvas></div>
+                        <div class="history-stats" id="fuel-stats"></div>
                     </div>
                 </div>
             </div>
@@ -839,21 +882,19 @@ DASHBOARD_HTML = '''
             // Stats
             const format = (v, u) => v !== undefined ? `${Math.round(v)}${u}` : '--';
             
-            const coolant = data.COOLANT_TEMP?.value;
-            const coolantEl = document.getElementById('coolant-value');
-            coolantEl.textContent = format(coolant, '°');
-            coolantEl.className = 'stat-value' + (coolant > 105 ? ' danger' : coolant > 95 ? ' warning' : '');
-            
             document.getElementById('intake-value').textContent = format(data.INTAKE_TEMP?.value, '°');
             document.getElementById('load-value').textContent = format(data.ENGINE_LOAD?.value, '%');
             document.getElementById('throttle-value').textContent = format(data.THROTTLE_POS?.value, '%');
+            document.getElementById('timing-value').textContent = format(data.TIMING_ADVANCE?.value, '°');
             
             const fuel = data.FUEL_LEVEL?.value;
             const fuelEl = document.getElementById('fuel-value');
             fuelEl.textContent = format(fuel, '%');
             fuelEl.className = 'stat-value' + (fuel < 15 ? ' danger' : fuel < 25 ? ' warning' : '');
             
-            document.getElementById('maf-value').textContent = data.MAF?.value ? `${data.MAF.value.toFixed(1)} g/s` : '--';
+            document.getElementById('maf-value').textContent = data.MAF?.value ? `${data.MAF.value.toFixed(1)}` : '--';
+            document.getElementById('voltage-value').textContent = data.CONTROL_MODULE_VOLTAGE?.value ? `${data.CONTROL_MODULE_VOLTAGE.value.toFixed(1)}` : '--';
+            document.getElementById('oil-value').textContent = data.OIL_TEMP?.value ? `${Math.round(data.OIL_TEMP.value)}°` : '--';
             
             // Sensors list
             const grid = document.getElementById('sensors-grid');
@@ -879,17 +920,56 @@ DASHBOARD_HTML = '''
             }
         }
         
+        function renderHistoryStats(containerId, points, unit = '') {
+            if (!points || points.length < 2) return '';
+            
+            const values = points.map(p => p.v);
+            const min = Math.min(...values);
+            const max = Math.max(...values);
+            const avg = values.reduce((a, b) => a + b, 0) / values.length;
+            const current = values[values.length - 1];
+            
+            const container = document.getElementById(containerId);
+            if (container) {
+                container.innerHTML = `
+                    <div class="history-stat">
+                        <div class="history-stat-value">${current.toFixed(1)}</div>
+                        <div class="history-stat-label">Current${unit}</div>
+                    </div>
+                    <div class="history-stat">
+                        <div class="history-stat-value">${avg.toFixed(1)}</div>
+                        <div class="history-stat-label">Avg${unit}</div>
+                    </div>
+                    <div class="history-stat">
+                        <div class="history-stat-value">${min.toFixed(1)}</div>
+                        <div class="history-stat-label">Min${unit}</div>
+                    </div>
+                    <div class="history-stat">
+                        <div class="history-stat-value">${max.toFixed(1)}</div>
+                        <div class="history-stat-label">Max${unit}</div>
+                    </div>
+                `;
+            }
+        }
+        
         async function fetchHistory() {
             try {
-                const [speed, rpm, load] = await Promise.all([
+                const [speed, rpm, load, fuel] = await Promise.all([
                     fetch('/api/history/SPEED?minutes=5').then(r => r.json()),
                     fetch('/api/history/RPM?minutes=5').then(r => r.json()),
                     fetch('/api/history/ENGINE_LOAD?minutes=5').then(r => r.json()),
+                    fetch('/api/history/FUEL_LEVEL?minutes=5').then(r => r.json()),
                 ]);
                 
                 drawChart('speed-chart', speed, '#3b82f6');
                 drawChart('rpm-chart', rpm, '#22c55e');
                 drawChart('load-chart', load, '#f59e0b');
+                drawChart('fuel-chart', fuel, '#22c55e');
+                
+                renderHistoryStats('speed-stats', speed, ' km/h');
+                renderHistoryStats('rpm-stats', rpm, ' RPM');
+                renderHistoryStats('load-stats', load, '%');
+                renderHistoryStats('fuel-stats', fuel, '%');
             } catch (e) {
                 console.error('Failed to fetch history', e);
             }
