@@ -365,6 +365,7 @@ class OBDManager:
         self.supported = []
         self.lock = threading.Lock()
         self.last_data = {}
+        self.last_sensor_data = {}
         self.dtc_codes = []
         
     def connect(self):
@@ -472,6 +473,8 @@ class OBDManager:
             if k not in data:
                 data[k] = v
         
+        if data:
+            self.last_sensor_data = data
         return data
     
     def read_all(self):
@@ -763,6 +766,26 @@ async def update_config(cfg: dict):
 async def websocket_endpoint(websocket: WebSocket):
     await ws_manager.connect(websocket)
     try:
+        if obd_manager.connected and obd_manager.last_sensor_data:
+            await websocket.send_json({
+                "type": "sensor_update",
+                "timestamp": time.time(),
+                "data": obd_manager.last_sensor_data,
+                "session_id": current_session_id,
+                "vehicle": vehicle_profile,
+                "session_stats": session_stats
+            })
+        else:
+            await websocket.send_json({
+                "type": "connection_progress",
+                "step": 0,
+                "progress": 0,
+                "message": "Waiting for OBD connection...",
+                "status": "info"
+            })
+    except Exception:
+        pass
+    try:
         while True:
             await websocket.receive_text()
     except WebSocketDisconnect:
@@ -926,6 +949,7 @@ DASHBOARD_HTML = '''
         .page-container {
             flex: 1;
             overflow: hidden;
+            position: relative;
         }
         
         .page {
@@ -1083,6 +1107,13 @@ DASHBOARD_HTML = '''
         .sparkline-canvas {
             height: 40px;
             width: 100%;
+        }
+        .sparkline-value {
+            font-size: 11px;
+            font-weight: 600;
+            color: var(--text);
+            text-align: center;
+            margin-top: 2px;
         }
         
         /* Action buttons */
@@ -1428,18 +1459,22 @@ DASHBOARD_HTML = '''
                         <div class="sparkline-card">
                             <div class="sparkline-label">RPM</div>
                             <canvas id="rpm-sparkline" class="sparkline-canvas"></canvas>
+                            <div class="sparkline-value" id="spark-rpm-val">--</div>
                         </div>
                         <div class="sparkline-card">
                             <div class="sparkline-label">Speed</div>
                             <canvas id="speed-sparkline" class="sparkline-canvas"></canvas>
+                            <div class="sparkline-value" id="spark-speed-val">--</div>
                         </div>
                         <div class="sparkline-card">
                             <div class="sparkline-label">Load</div>
                             <canvas id="load-sparkline" class="sparkline-canvas"></canvas>
+                            <div class="sparkline-value" id="spark-load-val">--</div>
                         </div>
                         <div class="sparkline-card">
                             <div class="sparkline-label">Throttle</div>
                             <canvas id="throttle-sparkline" class="sparkline-canvas"></canvas>
+                            <div class="sparkline-value" id="spark-throttle-val">--</div>
                         </div>
                     </div>
                     
@@ -1862,6 +1897,14 @@ DASHBOARD_HTML = '''
             drawSparkline('speed-sparkline', sparklineData.SPEED, '#3b82f6');
             drawSparkline('load-sparkline', sparklineData.ENGINE_LOAD, '#f59e0b');
             drawSparkline('throttle-sparkline', sparklineData.THROTTLE_POS, '#a855f7');
+            const rpm = (sparklineData.RPM || []).map(p => p.v !== undefined ? p.v : p);
+            const spd = (sparklineData.SPEED || []).map(p => p.v !== undefined ? p.v : p);
+            const ld = (sparklineData.ENGINE_LOAD || []).map(p => p.v !== undefined ? p.v : p);
+            const th = (sparklineData.THROTTLE_POS || []).map(p => p.v !== undefined ? p.v : p);
+            if (rpm.length) document.getElementById('spark-rpm-val').textContent = Math.round(rpm[rpm.length-1]);
+            if (spd.length) document.getElementById('spark-speed-val').textContent = Math.round(spd[spd.length-1]);
+            if (ld.length) document.getElementById('spark-load-val').textContent = Math.round(ld[ld.length-1]) + '%';
+            if (th.length) document.getElementById('spark-throttle-val').textContent = Math.round(th[th.length-1]) + '%';
         }
         
         // Chart drawing
