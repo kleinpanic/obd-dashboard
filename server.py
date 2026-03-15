@@ -188,6 +188,7 @@ class OBDManager:
         
         self.connecting = True
         ports = obd.scan_serial()
+        
         if not ports:
             self.connecting = False
             return False
@@ -336,6 +337,8 @@ ws_manager = ConnectionManager()
 # Background OBD reader
 async def obd_reader():
     consecutive_failures = 0
+    connection_step = 0
+    
     while True:
         if obd_manager.connected and ws_manager.active_connections:
             try:
@@ -351,19 +354,108 @@ async def obd_reader():
                 else:
                     consecutive_failures += 1
                     if consecutive_failures > 5:
-                        print("Too many failures, reconnecting...")
+                        await ws_manager.broadcast({
+                            "type": "connection_progress",
+                            "step": 1,
+                            "message": "Connection lost, reconnecting...",
+                            "status": "warning"
+                        })
                         obd_manager.disconnect()
                         await asyncio.sleep(1)
-                        obd_manager.connect()
+                        connection_step = 0
                         consecutive_failures = 0
             except Exception as e:
                 print(f"OBD reader error: {e}")
                 consecutive_failures += 1
-        elif obd_manager.connecting:
-            await ws_manager.broadcast({"type": "status", "status": "connecting"})
+                
+        elif obd_manager.connecting and ws_manager.active_connections:
+            # Already connecting, wait
+            pass
+            
         elif not obd_manager.connected and ws_manager.active_connections:
-            await ws_manager.broadcast({"type": "status", "status": "disconnected"})
-            obd_manager.connect()
+            # Start connection with progress updates
+            connection_step += 1
+            
+            if connection_step == 1:
+                await ws_manager.broadcast({
+                    "type": "connection_progress",
+                    "step": 1,
+                    "progress": 10,
+                    "message": "Scanning for OBD adapter...",
+                    "status": "info"
+                })
+                await asyncio.sleep(0.3)
+                
+            elif connection_step == 2:
+                import obd as obd_module
+                ports = obd_module.scan_serial()
+                if ports:
+                    await ws_manager.broadcast({
+                        "type": "connection_progress",
+                        "step": 2,
+                        "progress": 30,
+                        "message": f"Found adapter: {ports[0]}",
+                        "status": "success"
+                    })
+                else:
+                    await ws_manager.broadcast({
+                        "type": "connection_progress",
+                        "step": 2,
+                        "progress": 20,
+                        "message": "No adapter found, retrying...",
+                        "status": "error"
+                    })
+                    connection_step = 0
+                await asyncio.sleep(0.3)
+                
+            elif connection_step == 3:
+                await ws_manager.broadcast({
+                    "type": "connection_progress",
+                    "step": 3,
+                    "progress": 50,
+                    "message": "Initializing ELM327...",
+                    "status": "info"
+                })
+                await asyncio.sleep(0.3)
+                
+            elif connection_step == 4:
+                await ws_manager.broadcast({
+                    "type": "connection_progress",
+                    "step": 4,
+                    "progress": 70,
+                    "message": "Querying vehicle protocols...",
+                    "status": "info"
+                })
+                # Actually try to connect
+                if obd_manager.connect():
+                    await ws_manager.broadcast({
+                        "type": "connection_progress",
+                        "step": 5,
+                        "progress": 90,
+                        "message": f"Connected! {len(obd_manager.supported)} sensors found",
+                        "status": "success"
+                    })
+                    await asyncio.sleep(0.3)
+                    await ws_manager.broadcast({
+                        "type": "connection_progress",
+                        "step": 6,
+                        "progress": 100,
+                        "message": "Ready",
+                        "status": "success"
+                    })
+                else:
+                    await ws_manager.broadcast({
+                        "type": "connection_progress",
+                        "step": 4,
+                        "progress": 40,
+                        "message": "Connection failed, retrying...",
+                        "status": "error"
+                    })
+                    connection_step = 0
+                    obd_manager.connecting = False
+                await asyncio.sleep(0.3)
+            else:
+                connection_step = 0
         
         await asyncio.sleep(0.25)
 
@@ -490,6 +582,7 @@ DASHBOARD_HTML = '''
             align-items: center;
             justify-content: center;
             z-index: 1000;
+            padding: 20px;
         }
         
         .connection-overlay.hidden { display: none; }
@@ -501,14 +594,61 @@ DASHBOARD_HTML = '''
             border-top-color: var(--accent);
             border-radius: 50%;
             animation: spin 1s linear infinite;
+            margin-bottom: 20px;
         }
         
         @keyframes spin { to { transform: rotate(360deg); } }
         
         .connection-text {
-            margin-top: 20px;
             font-size: 16px;
             color: var(--muted);
+            margin-bottom: 20px;
+        }
+        
+        .progress-bar {
+            width: 200px;
+            height: 4px;
+            background: var(--border);
+            border-radius: 2px;
+            overflow: hidden;
+            margin-bottom: 16px;
+        }
+        
+        .progress-fill {
+            height: 100%;
+            background: var(--accent);
+            width: 0%;
+            transition: width 0.3s ease;
+        }
+        
+        .connection-logs {
+            width: 280px;
+            max-height: 120px;
+            overflow-y: auto;
+            background: var(--card);
+            border-radius: 8px;
+            padding: 10px;
+            font-family: 'SF Mono', 'Monaco', monospace;
+            font-size: 10px;
+        }
+        
+        .log-entry {
+            color: var(--muted);
+            padding: 2px 0;
+            display: flex;
+            gap: 6px;
+        }
+        
+        .log-entry .time {
+            color: #666;
+        }
+        
+        .log-entry.success {
+            color: var(--accent);
+        }
+        
+        .log-entry.error {
+            color: var(--danger);
         }
         
         /* Header */
@@ -975,7 +1115,11 @@ DASHBOARD_HTML = '''
     <!-- Connection overlay -->
     <div class="connection-overlay" id="connection-overlay">
         <div class="spinner"></div>
-        <div class="connection-text">Connecting to OBD...</div>
+        <div class="connection-text" id="connection-text">Initializing...</div>
+        <div class="progress-bar">
+            <div class="progress-fill" id="progress-fill"></div>
+        </div>
+        <div class="connection-logs" id="connection-logs"></div>
     </div>
     
     <div class="app">
@@ -1574,9 +1718,35 @@ DASHBOARD_HTML = '''
         }
         
         // WebSocket connection
+        let connectionLogs = [];
+        
+        function addLog(message, status = 'info') {
+            const now = new Date();
+            const time = now.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+            connectionLogs.push({ time, message, status });
+            
+            // Keep last 10 logs
+            if (connectionLogs.length > 10) {
+                connectionLogs.shift();
+            }
+            
+            const logsEl = document.getElementById('connection-logs');
+            if (logsEl) {
+                logsEl.innerHTML = connectionLogs.map(log => `
+                    <div class="log-entry ${log.status}">
+                        <span class="time">${log.time}</span>
+                        <span>${log.message}</span>
+                    </div>
+                `).join('');
+                logsEl.scrollTop = logsEl.scrollHeight;
+            }
+        }
+        
         function connect() {
             const wsUrl = `ws://${location.host}/ws`;
             console.log('Connecting to', wsUrl);
+            
+            addLog('Starting connection...', 'info');
             
             try {
                 ws = new WebSocket(wsUrl);
@@ -1586,7 +1756,6 @@ DASHBOARD_HTML = '''
                     isConnected = true;
                     document.getElementById('status-dot').classList.add('connected');
                     document.getElementById('status-text').textContent = 'Connected';
-                    document.getElementById('connection-overlay').classList.add('hidden');
                 };
                 
                 ws.onclose = () => {
@@ -1595,27 +1764,40 @@ DASHBOARD_HTML = '''
                     document.getElementById('status-dot').classList.remove('connected');
                     document.getElementById('status-text').textContent = 'Reconnecting...';
                     document.getElementById('connection-overlay').classList.remove('hidden');
+                    connectionLogs = [];
                     setTimeout(connect, 2000);
                 };
                 
-                ws.onerror = (e) => console.error('WebSocket error:', e);
+                ws.onerror = (e) => {
+                    console.error('WebSocket error:', e);
+                    addLog('WebSocket error', 'error');
+                };
                 
                 ws.onmessage = (event) => {
                     const msg = JSON.parse(event.data);
+                    
                     if (msg.type === 'sensor_update') {
                         Object.assign(data, msg.data);
                         updateUI();
-                    } else if (msg.type === 'status') {
-                        if (msg.status === 'connecting') {
-                            document.getElementById('connection-overlay').classList.remove('hidden');
-                            document.querySelector('.connection-text').textContent = 'Connecting to OBD...';
-                        } else if (msg.status === 'disconnected') {
-                            document.querySelector('.connection-text').textContent = 'OBD Disconnected - Reconnecting...';
+                        
+                        if (document.getElementById('connection-overlay').classList.contains('hidden') === false) {
+                            document.getElementById('connection-overlay').classList.add('hidden');
                         }
+                    } else if (msg.type === 'connection_progress') {
+                        // Update progress bar
+                        const progress = msg.progress || 0;
+                        document.getElementById('progress-fill').style.width = progress + '%';
+                        
+                        // Update text
+                        document.getElementById('connection-text').textContent = msg.message;
+                        
+                        // Add log
+                        addLog(msg.message, msg.status || 'info');
                     }
                 };
             } catch(e) {
                 console.error('WebSocket init error:', e);
+                addLog('Connection failed: ' + e.message, 'error');
                 setTimeout(connect, 2000);
             }
         }
