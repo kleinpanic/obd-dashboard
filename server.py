@@ -57,16 +57,38 @@ def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     
+    # Vehicle profiles table
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS vehicle_profiles (
+            vin TEXT PRIMARY KEY,
+            make TEXT,
+            model TEXT,
+            year INTEGER,
+            max_rpm INTEGER DEFAULT 8000,
+            max_speed INTEGER DEFAULT 200,
+            redline_rpm INTEGER DEFAULT 6500,
+            normal_temp_min REAL DEFAULT 70,
+            normal_temp_max REAL DEFAULT 95,
+            warning_temp REAL DEFAULT 105,
+            low_fuel_warning REAL DEFAULT 25,
+            low_fuel_danger REAL DEFAULT 15,
+            created_at REAL,
+            updated_at REAL
+        )
+    ''')
+    
     # Sessions table
     c.execute('''
         CREATE TABLE IF NOT EXISTS sessions (
             id TEXT PRIMARY KEY,
+            vin TEXT,
             start_time REAL,
             end_time REAL,
             distance_km REAL DEFAULT 0,
             max_rpm INTEGER DEFAULT 0,
             max_speed INTEGER DEFAULT 0,
-            avg_fuel REAL DEFAULT 0
+            avg_fuel REAL DEFAULT 0,
+            FOREIGN KEY (vin) REFERENCES vehicle_profiles(vin)
         )
     ''')
     
@@ -103,13 +125,173 @@ def init_db():
         )
     ''')
     
+    # Vehicle stats cache
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS vehicle_stats (
+            vin TEXT PRIMARY KEY,
+            total_sessions INTEGER DEFAULT 0,
+            total_distance_km REAL DEFAULT 0,
+            total_duration_seconds INTEGER DEFAULT 0,
+            max_rpm_ever INTEGER DEFAULT 0,
+            max_speed_ever INTEGER DEFAULT 0,
+            avg_rpm REAL DEFAULT 0,
+            avg_speed REAL DEFAULT 0,
+            last_session REAL
+        )
+    ''')
+    
     conn.commit()
     conn.close()
 
 init_db()
 
+# Vehicle profile management
+def get_vehicle_profile(vin):
+    """Get or create vehicle profile for VIN"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT * FROM vehicle_profiles WHERE vin = ?", (vin,))
+    row = c.fetchone()
+    
+    if row:
+        conn.close()
+        return {
+            "vin": row[0],
+            "make": row[1],
+            "model": row[2],
+            "year": row[3],
+            "max_rpm": row[4],
+            "max_speed": row[5],
+            "redline_rpm": row[6],
+            "normal_temp_min": row[7],
+            "normal_temp_max": row[8],
+            "warning_temp": row[9],
+            "low_fuel_warning": row[10],
+            "low_fuel_danger": row[11],
+        }
+    
+    # Create new profile with defaults
+    now = time.time()
+    c.execute('''
+        INSERT INTO vehicle_profiles (vin, created_at, updated_at)
+        VALUES (?, ?, ?)
+    ''', (vin, now, now))
+    conn.commit()
+    conn.close()
+    
+    return {
+        "vin": vin,
+        "max_rpm": 8000,
+        "max_speed": 200,
+        "redline_rpm": 6500,
+        "normal_temp_min": 70,
+        "normal_temp_max": 95,
+        "warning_temp": 105,
+        "low_fuel_warning": 25,
+        "low_fuel_danger": 15,
+    }
+
+def update_vehicle_profile(vin, **kwargs):
+    """Update vehicle profile fields"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    fields = []
+    values = []
+    for k, v in kwargs.items():
+        fields.append(f"{k} = ?")
+        values.append(v)
+    
+    values.append(time.time())  # updated_at
+    values.append(vin)
+    
+    c.execute(f'''
+        UPDATE vehicle_profiles 
+        SET {', '.join(fields)}, updated_at = ?
+        WHERE vin = ?
+    ''', values)
+    conn.commit()
+    conn.close()
+
+def get_vehicle_stats(vin):
+    """Get aggregated stats for a vehicle"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    # Get from cache
+    c.execute("SELECT * FROM vehicle_stats WHERE vin = ?", (vin,))
+    row = c.fetchone()
+    
+    if row:
+        conn.close()
+        return {
+            "total_sessions": row[1],
+            "total_distance_km": row[2],
+            "total_duration_seconds": row[3],
+            "max_rpm_ever": row[4],
+            "max_speed_ever": row[5],
+            "avg_rpm": row[6],
+            "avg_speed": row[7],
+            "last_session": row[8],
+        }
+    
+    # Calculate from sessions
+    c.execute('''
+        SELECT 
+            COUNT(*),
+            COALESCE(SUM(distance_km), 0),
+            COALESCE(SUM(end_time - start_time), 0),
+            COALESCE(MAX(max_rpm), 0),
+            COALESCE(MAX(max_speed), 0)
+        FROM sessions WHERE vin = ?
+    ''', (vin,))
+    row = c.fetchone()
+    
+    stats = {
+        "total_sessions": row[0],
+        "total_distance_km": row[1],
+        "total_duration_seconds": int(row[2]) if row[2] else 0,
+        "max_rpm_ever": row[3],
+        "max_speed_ever": row[4],
+        "avg_rpm": 0,
+        "avg_speed": 0,
+    }
+    
+    conn.close()
+    return stats
+
+def save_session_stats(session_id, vin, data):
+    """Save aggregated session stats"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    # Update session record
+    c.execute('''
+        UPDATE sessions 
+        SET vin = ?, max_rpm = ?, max_speed = ?, end_time = ?
+        WHERE id = ?
+    ''', (vin, data.get('max_rpm', 0), data.get('max_speed', 0), time.time(), session_id))
+    
+    # Update vehicle stats cache
+    c.execute('''
+        INSERT INTO vehicle_stats (vin, total_sessions, max_rpm_ever, max_speed_ever, last_session)
+        VALUES (?, 1, ?, ?, ?)
+        ON CONFLICT(vin) DO UPDATE SET
+            total_sessions = total_sessions + 1,
+            max_rpm_ever = MAX(max_rpm_ever, ?),
+            max_speed_ever = MAX(max_speed_ever, ?),
+            last_session = ?
+    ''', (vin, data.get('max_rpm', 0), data.get('max_speed', 0), time.time(),
+          data.get('max_rpm', 0), data.get('max_speed', 0), time.time()))
+    
+    conn.commit()
+    conn.close()
+
 current_session_id = str(uuid.uuid4())
 session_start_time = None
+current_vin = None
+vehicle_profile = None
+session_stats = {"max_rpm": 0, "max_speed": 0}
 
 def start_session():
     global current_session_id, session_start_time
@@ -123,13 +305,9 @@ def start_session():
     conn.close()
 
 def end_session():
-    global session_start_time
+    global session_start_time, session_stats
     if session_start_time:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("UPDATE sessions SET end_time = ? WHERE id = ?", (time.time(), current_session_id))
-        conn.commit()
-        conn.close()
+        save_session_stats(current_session_id, current_vin, session_stats)
         session_start_time = None
 
 def log_sensor(sensor: str, value: float, unit: str):
@@ -183,6 +361,7 @@ class OBDManager:
         self.dtc_codes = []
         
     def connect(self):
+        global current_vin, vehicle_profile
         if not OBD_AVAILABLE:
             return False
         
@@ -199,6 +378,22 @@ class OBDManager:
                 self.connecting = False
                 self.supported = list(self.connection.supported_commands)
                 self.last_data = {}
+                
+                # Get VIN and load vehicle profile
+                try:
+                    vin_resp = self.connection.query(obd.commands.VIN)
+                    if not vin_resp.is_null():
+                        vin_val = vin_resp.value
+                        # Handle both string and bytes
+                        if isinstance(vin_val, bytes):
+                            current_vin = vin_val.decode('utf-8').strip()
+                        else:
+                            current_vin = str(vin_val).strip()
+                        vehicle_profile = get_vehicle_profile(current_vin)
+                except Exception as e:
+                    print(f"VIN decode error: {e}")
+                    pass
+                
                 start_session()
                 return True
         except Exception as e:
@@ -224,6 +419,7 @@ class OBDManager:
             return False
     
     def read_key_sensors(self):
+        global session_stats
         if not self.connected:
             return {}
         
@@ -251,6 +447,12 @@ class OBDManager:
                                 data[cmd.name] = {"value": value, "unit": unit}
                                 log_sensor(cmd.name, value, unit)
                                 self.last_data[cmd.name] = data[cmd.name]
+                                
+                                # Track session maxes
+                                if cmd.name == 'RPM':
+                                    session_stats['max_rpm'] = max(session_stats['max_rpm'], int(value))
+                                elif cmd.name == 'SPEED':
+                                    session_stats['max_speed'] = max(session_stats['max_speed'], int(value))
                     except Exception as e:
                         pass
         
@@ -348,7 +550,9 @@ async def obd_reader():
                         "type": "sensor_update",
                         "timestamp": time.time(),
                         "data": data,
-                        "session_id": current_session_id
+                        "session_id": current_session_id,
+                        "vehicle": vehicle_profile,
+                        "session_stats": session_stats
                     })
                     consecutive_failures = 0
                 else:
@@ -478,10 +682,37 @@ async def status():
         "connected": obd_manager.connected,
         "connecting": obd_manager.connecting,
         "sensors_supported": len(obd_manager.supported),
-        "vin": obd_manager.get_vin(),
+        "vin": current_vin,
         "session_id": current_session_id,
-        "session_start": session_start_time
+        "session_start": session_start_time,
+        "session_max_rpm": session_stats.get('max_rpm', 0),
+        "session_max_speed": session_stats.get('max_speed', 0)
     }
+
+@app.get("/api/vehicle")
+async def get_vehicle():
+    if not current_vin:
+        return {"error": "No VIN detected"}
+    
+    profile = get_vehicle_profile(current_vin)
+    stats = get_vehicle_stats(current_vin)
+    
+    return {
+        "vin": current_vin,
+        "profile": profile,
+        "stats": stats
+    }
+
+@app.post("/api/vehicle")
+async def update_vehicle(data: dict):
+    if not current_vin:
+        return {"error": "No VIN detected"}
+    
+    update_vehicle_profile(current_vin, **data)
+    global vehicle_profile
+    vehicle_profile = get_vehicle_profile(current_vin)
+    
+    return vehicle_profile
 
 @app.get("/api/sensors")
 async def sensors():
@@ -1248,6 +1479,84 @@ DASHBOARD_HTML = '''
             <!-- Config Page -->
             <div class="page" id="page-config">
                 <div class="config-page">
+                    <div class="section-title">Vehicle</div>
+                    <div class="config-section">
+                        <div class="config-item">
+                            <div>
+                                <div class="config-label">VIN</div>
+                                <div class="config-desc" id="vehicle-vin">--</div>
+                            </div>
+                        </div>
+                        <div class="config-item">
+                            <div>
+                                <div class="config-label">Max RPM / Redline</div>
+                                <div class="config-desc" id="vehicle-redline">--</div>
+                            </div>
+                        </div>
+                        <div class="config-item">
+                            <div>
+                                <div class="config-label">Max Speed</div>
+                                <div class="config-desc" id="vehicle-maxspeed">--</div>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="section-title">Vehicle Stats (All Time)</div>
+                    <div class="config-section">
+                        <div class="config-item">
+                            <div>
+                                <div class="config-label">Total Sessions</div>
+                                <div class="config-desc" id="stats-sessions">--</div>
+                            </div>
+                        </div>
+                        <div class="config-item">
+                            <div>
+                                <div class="config-label">Max RPM Ever</div>
+                                <div class="config-desc" id="stats-maxrpm">--</div>
+                            </div>
+                        </div>
+                        <div class="config-item">
+                            <div>
+                                <div class="config-label">Max Speed Ever</div>
+                                <div class="config-desc" id="stats-maxspeed">--</div>
+                            </div>
+                        </div>
+                        <div class="config-item">
+                            <div>
+                                <div class="config-label">Total Distance</div>
+                                <div class="config-desc" id="stats-distance">--</div>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="section-title">Session</div>
+                    <div class="config-section">
+                        <div class="config-item">
+                            <div>
+                                <div class="config-label">Session ID</div>
+                                <div class="config-desc" id="session-id">--</div>
+                            </div>
+                        </div>
+                        <div class="config-item">
+                            <div>
+                                <div class="config-label">Session Start</div>
+                                <div class="config-desc" id="session-start">--</div>
+                            </div>
+                        </div>
+                        <div class="config-item">
+                            <div>
+                                <div class="config-label">Session Max RPM</div>
+                                <div class="config-desc" id="session-maxrpm">--</div>
+                            </div>
+                        </div>
+                        <div class="config-item">
+                            <div>
+                                <div class="config-label">Session Max Speed</div>
+                                <div class="config-desc" id="session-maxspeed">--</div>
+                            </div>
+                        </div>
+                    </div>
+                    
                     <div class="section-title">Settings</div>
                     
                     <div class="config-section">
@@ -1367,6 +1676,8 @@ DASHBOARD_HTML = '''
     <script>
         const data = {};
         let config = { theme: 'dark', units: 'metric' };
+        let vehicle = { max_rpm: 8000, max_speed: 200, redline_rpm: 6500, low_fuel_warning: 25, low_fuel_danger: 15 };
+        let sessionMax = { rpm: 0, speed: 0 };
         let ws;
         let isConnected = false;
         
@@ -1490,14 +1801,17 @@ DASHBOARD_HTML = '''
             const rpm = data.RPM?.value || 0;
             const rpmEl = document.getElementById('rpm-value');
             rpmEl.textContent = Math.round(rpm).toLocaleString();
-            rpmEl.className = 'gauge-value' + (rpm > 6000 ? ' danger' : rpm > 5000 ? ' warning' : '');
-            drawGauge('rpm-gauge', rpm, 8000, rpm > 6000 ? '#ef4444' : rpm > 5000 ? '#f59e0b' : '#22c55e');
+            
+            // Color based on vehicle redline
+            const rpmColor = rpm > vehicle.redline_rpm ? '#ef4444' : rpm > vehicle.redline_rpm * 0.9 ? '#f59e0b' : '#22c55e';
+            rpmEl.className = 'gauge-value' + (rpm > vehicle.redline_rpm ? ' danger' : rpm > vehicle.redline_rpm * 0.9 ? ' warning' : '');
+            drawGauge('rpm-gauge', rpm, vehicle.max_rpm, rpmColor);
             
             const speedKmh = data.SPEED?.value || 0;
             const speed = convertSpeed(speedKmh);
             document.getElementById('speed-value').textContent = Math.round(speed);
             document.getElementById('speed-unit').textContent = config.units === 'metric' ? 'km/h' : 'mph';
-            drawGauge('speed-gauge', speed, config.units === 'metric' ? 200 : 125, '#3b82f6');
+            drawGauge('speed-gauge', speed, config.units === 'metric' ? vehicle.max_speed : vehicle.max_speed * 0.621, '#3b82f6');
             
             const format = (v, u) => v !== undefined ? `${Math.round(v)}${u}` : '--';
             
@@ -1505,14 +1819,19 @@ DASHBOARD_HTML = '''
             document.getElementById('intake-value').textContent = format(convertTemp(intakeTemp), '');
             document.getElementById('intake-label').textContent = `Intake ${unitC}`;
             
-            document.getElementById('load-value').textContent = format(data.ENGINE_LOAD?.value, '%');
+            // Engine load color
+            const load = data.ENGINE_LOAD?.value || 0;
+            const loadEl = document.getElementById('load-value');
+            loadEl.textContent = format(load, '%');
+            loadEl.className = 'stat-value' + (load > 90 ? ' danger' : load > 75 ? ' warning' : '');
+            
             document.getElementById('throttle-value').textContent = format(data.THROTTLE_POS?.value, '%');
             document.getElementById('timing-value').textContent = format(data.TIMING_ADVANCE?.value, '°');
             
             const fuel = data.FUEL_LEVEL?.value;
             const fuelEl = document.getElementById('fuel-value');
             fuelEl.textContent = format(fuel, '%');
-            fuelEl.className = 'stat-value' + (fuel < 15 ? ' danger' : fuel < 25 ? ' warning' : '');
+            fuelEl.className = 'stat-value' + (fuel < vehicle.low_fuel_danger ? ' danger' : fuel < vehicle.low_fuel_warning ? ' warning' : '');
             
             document.getElementById('maf-value').textContent = data.MAF?.value ? `${data.MAF.value.toFixed(1)}` : '--';
             document.getElementById('voltage-value').textContent = data.CONTROL_MODULE_VOLTAGE?.value ? `${data.CONTROL_MODULE_VOLTAGE.value.toFixed(1)}` : '--';
@@ -1531,6 +1850,24 @@ DASHBOARD_HTML = '''
                         <div class="sensor-value">${val.value.toFixed(1)}<span class="sensor-unit">${val.unit}</span></div>
                     </div>
                 `).join('');
+        }
+        
+        function updateVehicleUI() {
+            fetch('/api/vehicle').then(r => r.json()).then(v => {
+                if (v.profile) {
+                    vehicle = v.profile;
+                    document.getElementById('vehicle-vin').textContent = v.vin || '--';
+                    document.getElementById('vehicle-redline').textContent = `${vehicle.max_rpm || 8000} / ${vehicle.redline_rpm || 6500}`;
+                    document.getElementById('vehicle-maxspeed').textContent = `${vehicle.max_speed || 200} km/h`;
+                }
+                if (v.stats) {
+                    const stats = v.stats;
+                    document.getElementById('stats-sessions').textContent = stats.total_sessions || 0;
+                    document.getElementById('stats-maxrpm').textContent = stats.max_rpm_ever || 0;
+                    document.getElementById('stats-maxspeed').textContent = `${stats.max_speed_ever || 0} km/h`;
+                    document.getElementById('stats-distance').textContent = `${(stats.total_distance_km || 0).toFixed(1)} km`;
+                }
+            }).catch(() => {});
         }
         
         function getSensorDescription(name) {
@@ -1713,6 +2050,11 @@ DASHBOARD_HTML = '''
                 document.getElementById('session-start').textContent = status.session_start 
                     ? new Date(status.session_start * 1000).toLocaleTimeString() 
                     : '--';
+                document.getElementById('session-maxrpm').textContent = status.session_max_rpm || 0;
+                document.getElementById('session-maxspeed').textContent = `${status.session_max_speed || 0} km/h`;
+                
+                // Also update vehicle info
+                updateVehicleUI();
             } catch(e) {}
         }
         
@@ -1777,6 +2119,12 @@ DASHBOARD_HTML = '''
                     
                     if (msg.type === 'sensor_update') {
                         Object.assign(data, msg.data);
+                        if (msg.vehicle) {
+                            vehicle = msg.vehicle;
+                        }
+                        if (msg.session_stats) {
+                            sessionMax = msg.session_stats;
+                        }
                         updateUI();
                         
                         if (document.getElementById('connection-overlay').classList.contains('hidden') === false) {
