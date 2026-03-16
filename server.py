@@ -165,50 +165,135 @@ def init_db():
 init_db()
 
 # Vehicle profile management
+# ── VIN decode ──────────────────────────────────────────────────────────────
+# WMI prefix (first 5 chars) + engine code (position 8, 0-indexed pos 7)
+# → (make, model, redline_rpm, max_rpm, max_speed_kmh)
+# max_speed = speedometer dial max, not ECU limiter
+_VIN_SPECS = {
+    # Subaru Crosstrek (JF2GT) - 2.0L FB20 (engine code C)
+    ("JF2GT", "C"): ("Subaru", "Crosstrek 2.0L", 6000, 7000, 240),
+    # Subaru Crosstrek 2.5L (engine code N, 2024+)
+    ("JF2GT", "N"): ("Subaru", "Crosstrek 2.5L", 6400, 7500, 240),
+    # Subaru WRX / WRX STI
+    ("JF1VA", "H"): ("Subaru", "WRX 2.0T", 6800, 8000, 260),
+    ("JF1GR", "X"): ("Subaru", "WRX STI 2.5T", 7200, 8500, 280),
+    # Subaru Outback / Legacy 2.5L
+    ("4S4BT", "A"): ("Subaru", "Outback 2.5L", 6500, 7500, 220),
+    # Toyota Corolla
+    ("JTDBU", "U"): ("Toyota", "Corolla 1.8L", 6400, 7500, 200),
+    # Honda Civic
+    ("2HGF", "R"): ("Honda", "Civic 1.5T", 6200, 7000, 220),
+    # Ford F-150 5.0L
+    ("1FTEW", "F"): ("Ford", "F-150 5.0L", 6500, 7000, 200),
+}
+
+_MODEL_YEAR = {
+    'A': 2010, 'B': 2011, 'C': 2012, 'D': 2013, 'E': 2014,
+    'F': 2015, 'G': 2016, 'H': 2017, 'J': 2018, 'K': 2019,
+    'L': 2020, 'M': 2021, 'N': 2022, 'P': 2023, 'R': 2024, 'S': 2025,
+}
+
+
+def decode_vin(vin: str) -> dict:
+    """
+    Decode VIN into vehicle specs using WMI pattern + engine code.
+    Position key:
+      vin[0:3]  = WMI (World Manufacturer Identifier)
+      vin[0:5]  = WMI prefix used for model matching
+      vin[7]    = engine/restraint code (position 8)
+      vin[9]    = model year code (position 10)
+    Returns dict with make, model, year, redline_rpm, max_rpm, max_speed.
+    Falls back to sensible defaults for unknown VINs.
+    """
+    if not vin or len(vin) < 10:
+        return {}
+
+    wmi5 = vin[:5]
+    engine_code = vin[7]
+    year = _MODEL_YEAR.get(vin[9])
+
+    specs = None
+    # Exact match: WMI prefix + engine code
+    if (wmi5, engine_code) in _VIN_SPECS:
+        specs = _VIN_SPECS[(wmi5, engine_code)]
+    else:
+        # Fallback: match on WMI prefix alone
+        for (wmi, _eng), s in _VIN_SPECS.items():
+            if vin.startswith(wmi):
+                specs = s
+                break
+
+    result = {}
+    if year:
+        result["year"] = year
+    if specs:
+        make, model, redline, max_rpm, max_speed = specs
+        result.update({
+            "make": make, "model": model,
+            "redline_rpm": redline, "max_rpm": max_rpm, "max_speed": max_speed,
+        })
+    return result
+
+
 def get_vehicle_profile(vin):
-    """Get or create vehicle profile for VIN"""
+    """Get or create vehicle profile for VIN, auto-decoding specs from VIN."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT * FROM vehicle_profiles WHERE vin = ?", (vin,))
     row = c.fetchone()
 
-    if row:
-        conn.close()
-        return {
-            "vin": row[0],
-            "make": row[1],
-            "model": row[2],
-            "year": row[3],
-            "max_rpm": row[4],
-            "max_speed": row[5],
-            "redline_rpm": row[6],
-            "normal_temp_min": row[7],
-            "normal_temp_max": row[8],
-            "warning_temp": row[9],
-            "low_fuel_warning": row[10],
-            "low_fuel_danger": row[11],
-        }
+    decoded = decode_vin(vin)
 
-    # Create new profile with defaults
+    # Defaults (used when VIN is unknown)
+    defaults = {
+        "max_rpm": decoded.get("max_rpm", 8000),
+        "max_speed": decoded.get("max_speed", 200),
+        "redline_rpm": decoded.get("redline_rpm", 6500),
+        "normal_temp_min": 70, "normal_temp_max": 95,
+        "warning_temp": 105,
+        "low_fuel_warning": 25, "low_fuel_danger": 15,
+    }
+
+    if row:
+        existing = {
+            "vin": row[0], "make": row[1], "model": row[2], "year": row[3],
+            "max_rpm": row[4], "max_speed": row[5], "redline_rpm": row[6],
+            "normal_temp_min": row[7], "normal_temp_max": row[8],
+            "warning_temp": row[9], "low_fuel_warning": row[10], "low_fuel_danger": row[11],
+        }
+        # If profile was created with generic defaults, upgrade it with decoded specs
+        if existing["max_rpm"] in (8000,) and decoded.get("max_rpm"):
+            update_vehicle_profile(vin,
+                make=decoded.get("make"), model=decoded.get("model"),
+                year=decoded.get("year"),
+                max_rpm=decoded["max_rpm"], max_speed=decoded["max_speed"],
+                redline_rpm=decoded["redline_rpm"],
+            )
+            existing.update({
+                "make": decoded.get("make"), "model": decoded.get("model"),
+                "year": decoded.get("year"), "max_rpm": decoded["max_rpm"],
+                "max_speed": decoded["max_speed"], "redline_rpm": decoded["redline_rpm"],
+            })
+        conn.close()
+        return existing
+
+    # Create new profile
     now = time.time()
     c.execute('''
-        INSERT INTO vehicle_profiles (vin, created_at, updated_at)
-        VALUES (?, ?, ?)
-    ''', (vin, now, now))
+        INSERT INTO vehicle_profiles (vin, make, model, year, max_rpm, max_speed,
+            redline_rpm, normal_temp_min, normal_temp_max, warning_temp,
+            low_fuel_warning, low_fuel_danger, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (
+        vin, decoded.get("make"), decoded.get("model"), decoded.get("year"),
+        defaults["max_rpm"], defaults["max_speed"], defaults["redline_rpm"],
+        defaults["normal_temp_min"], defaults["normal_temp_max"], defaults["warning_temp"],
+        defaults["low_fuel_warning"], defaults["low_fuel_danger"], now, now,
+    ))
     conn.commit()
     conn.close()
 
-    return {
-        "vin": vin,
-        "max_rpm": 8000,
-        "max_speed": 200,
-        "redline_rpm": 6500,
-        "normal_temp_min": 70,
-        "normal_temp_max": 95,
-        "warning_temp": 105,
-        "low_fuel_warning": 25,
-        "low_fuel_danger": 15,
-    }
+    return {"vin": vin, **decoded, **defaults}
 
 def update_vehicle_profile(vin, **kwargs):
     """Update vehicle profile fields"""
@@ -597,7 +682,7 @@ async def obd_reader():
                                 start_session(reason="engine_on")
                                 logger.info(f"ENGINE ON rpm={rpm:.0f}")
                         else:
-                            # RPM near 0 — may be engine off
+                            # RPM near 0 - may be engine off
                             if engine_on:
                                 if engine_off_since is None:
                                     engine_off_since = time.time()
@@ -792,7 +877,7 @@ async def update_vehicle(data: dict):
 
 @app.get("/api/sensors")
 async def sensors():
-    # Return cached data — avoids blocking the event loop with 122 synchronous OBD queries.
+    # Return cached data - avoids blocking the event loop with 122 synchronous OBD queries.
     # last_sensor_data is kept fresh by the WS reader loop at 4Hz.
     # Falls back to last_data which accumulates across all queries.
     if obd_manager.last_sensor_data:
@@ -827,6 +912,39 @@ async def update_config(cfg: dict):
     config.update(cfg)
     save_config(config)
     return config
+
+
+@app.get("/api/logs")
+async def get_logs(limit: int = 100, offset: int = 0):
+    """Return paginated, parsed log entries from the log file (newest first)."""
+    try:
+        if not LOG_PATH.exists():
+            return {"entries": [], "total": 0, "offset": offset, "limit": limit}
+        lines = LOG_PATH.read_text(errors="replace").splitlines()
+        # Only app-level structured entries (skip raw obd library noise)
+        app_lines = [
+            l for l in lines
+            if any(tag in l for tag in ("[INFO]", "[WARNING]", "[ERROR]", "[DEBUG]"))
+            and l.strip()
+        ]
+        app_lines.reverse()  # newest first
+        total = len(app_lines)
+        page = app_lines[offset:offset + limit]
+        entries = []
+        for line in page:
+            level = "info"
+            if "[ERROR]" in line:
+                level = "error"
+            elif "[WARNING]" in line:
+                level = "warning"
+            elif "[DEBUG]" in line:
+                level = "debug"
+            entries.append({"text": line.strip(), "level": level})
+        return {"entries": entries, "total": total, "offset": offset, "limit": limit}
+    except Exception as e:
+        logger.error(f"Failed to read logs: {e}")
+        return {"entries": [], "total": 0, "offset": offset, "limit": limit}
+
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -1160,7 +1278,7 @@ DASHBOARD_HTML = '''
             background: var(--card);
             border: 1px solid var(--border);
             border-radius: 8px;
-            padding: 8px;
+            padding: 8px 6px 6px 6px;
         }
 
         .sparkline-label {
@@ -1171,16 +1289,72 @@ DASHBOARD_HTML = '''
         }
 
         .sparkline-canvas {
-            height: 40px;
+            height: 48px;
             width: 100%;
+            display: block;
         }
+
         .sparkline-value {
             font-size: 11px;
             font-weight: 600;
             color: var(--text);
             text-align: center;
-            margin-top: 2px;
+            margin-top: 3px;
         }
+
+        /* Logs section */
+        .logs-toggle {
+            cursor: pointer;
+            user-select: none;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .logs-toggle:hover { opacity: 0.8; }
+
+        .logs-section {
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            margin-bottom: 16px;
+            overflow: hidden;
+        }
+
+        .logs-list {
+            height: 280px;
+            overflow-y: auto;
+            padding: 8px;
+            font-family: 'Courier New', monospace;
+            font-size: 10px;
+            line-height: 1.5;
+        }
+
+        .log-entry { padding: 2px 4px; border-radius: 3px; margin-bottom: 1px; word-break: break-all; }
+        .log-entry.info  { color: var(--accent); }
+        .log-entry.warning { color: var(--warning); }
+        .log-entry.error { color: var(--danger); }
+        .log-entry.debug { color: var(--muted); }
+
+        .logs-footer {
+            padding: 8px 12px;
+            border-top: 1px solid var(--border);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .logs-meta { font-size: 11px; color: var(--muted); }
+
+        .logs-load-btn {
+            background: var(--border);
+            border: none;
+            color: var(--text);
+            padding: 4px 12px;
+            border-radius: 6px;
+            font-size: 11px;
+            cursor: pointer;
+        }
+        .logs-load-btn:hover { background: var(--muted); }
 
         /* Action buttons */
         .action-buttons {
@@ -1649,13 +1823,19 @@ DASHBOARD_HTML = '''
                         </div>
                         <div class="config-item">
                             <div>
+                                <div class="config-label">Make / Model / Year</div>
+                                <div class="config-desc" id="vehicle-model">--</div>
+                            </div>
+                        </div>
+                        <div class="config-item">
+                            <div>
                                 <div class="config-label">Max RPM / Redline</div>
                                 <div class="config-desc" id="vehicle-redline">--</div>
                             </div>
                         </div>
                         <div class="config-item">
                             <div>
-                                <div class="config-label">Max Speed</div>
+                                <div class="config-label">Max Speed (gauge)</div>
                                 <div class="config-desc" id="vehicle-maxspeed">--</div>
                             </div>
                         </div>
@@ -1736,6 +1916,17 @@ DASHBOARD_HTML = '''
                         </div>
                     </div>
 
+                    <div class="section-title logs-toggle" onclick="toggleLogs(this)">
+                        System Logs
+                        <span id="logs-chevron" style="font-size:12px;color:var(--muted);">▶ collapsed</span>
+                    </div>
+                    <div id="logs-section" class="logs-section" style="display:none;">
+                        <div id="logs-list" class="logs-list"></div>
+                        <div class="logs-footer">
+                            <button class="logs-load-btn" id="logs-more-btn" onclick="loadMoreLogs()" style="display:none;">Load more</button>
+                            <span id="logs-meta" class="logs-meta">--</span>
+                        </div>
+                    </div>
 
                 </div>
             </div>
@@ -1926,22 +2117,65 @@ DASHBOARD_HTML = '''
 
             const w = rect.width;
             const h = rect.height;
-            const padding = 2;
+            const padL = 26, padR = 3, padT = 6, padB = 4;
 
-            const max = Math.max(...values, 1);
-            const min = Math.min(...values, 0);
-            const range = max - min || 1;
+            const rawMax = Math.max(...values);
+            const rawMin = Math.min(...values);
+            const range = rawMax - rawMin || 1;
 
+            const toY = v => padT + (1 - (v - rawMin) / range) * (h - padT - padB);
+            const toX = i => padL + (i / (values.length - 1)) * (w - padL - padR);
+
+            // Grid lines at 25%, 50%, 75%
+            ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+            ctx.lineWidth = 0.5;
+            [0.25, 0.5, 0.75].forEach(pct => {
+                const y = padT + pct * (h - padT - padB);
+                ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(w - padR, y); ctx.stroke();
+            });
+
+            // Y-axis labels: max at top, min at bottom
+            ctx.fillStyle = 'rgba(255,255,255,0.3)';
+            ctx.font = '6px sans-serif';
+            ctx.textAlign = 'right';
+            ctx.fillText(rawMax >= 1000 ? (rawMax/1000).toFixed(1)+'k' : Math.round(rawMax), padL - 2, padT + 5);
+            ctx.fillText(rawMin >= 1000 ? (rawMin/1000).toFixed(1)+'k' : Math.round(rawMin), padL - 2, h - padB);
+
+            // Filled area under line
             ctx.beginPath();
             values.forEach((v, i) => {
-                const x = padding + (i / (values.length - 1)) * (w - padding * 2);
-                const y = h - padding - ((v - min) / range) * (h - padding * 2);
-                if (i === 0) ctx.moveTo(x, y);
-                else ctx.lineTo(x, y);
+                const x = toX(i), y = toY(v);
+                if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+            });
+            ctx.lineTo(toX(values.length - 1), h - padB);
+            ctx.lineTo(toX(0), h - padB);
+            ctx.closePath();
+            ctx.fillStyle = color.replace(')', ', 0.12)').replace('rgb', 'rgba').replace('#', 'rgba(').replace('rgba(', 'rgba(');
+            // Simple semi-transparent fill
+            const grad = ctx.createLinearGradient(0, padT, 0, h);
+            grad.addColorStop(0, color + '33');
+            grad.addColorStop(1, color + '00');
+            ctx.fillStyle = grad;
+            ctx.fill();
+
+            // Data line
+            ctx.beginPath();
+            values.forEach((v, i) => {
+                const x = toX(i), y = toY(v);
+                if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
             });
             ctx.strokeStyle = color;
             ctx.lineWidth = 1.5;
+            ctx.lineJoin = 'round';
             ctx.stroke();
+
+            // Current value dot
+            const lastX = toX(values.length - 1);
+            const lastY = toY(values[values.length - 1]);
+            ctx.beginPath();
+            ctx.arc(lastX, lastY, 2, 0, Math.PI * 2);
+            ctx.fillStyle = color;
+            ctx.fill();
         }
 
         function updateSparklines() {
@@ -2080,13 +2314,68 @@ DASHBOARD_HTML = '''
                 `).join('');
         }
 
+        // ── Logs ──────────────────────────────────────────────────────────────
+        let logsOffset = 0;
+        const LOGS_PER_PAGE = 100;
+
+        function toggleLogs(btn) {
+            const section = document.getElementById('logs-section');
+            const chevron = document.getElementById('logs-chevron');
+            const visible = section.style.display !== 'none';
+            if (visible) {
+                section.style.display = 'none';
+                chevron.textContent = '▶ collapsed';
+            } else {
+                section.style.display = 'block';
+                chevron.textContent = '▼';
+                if (logsOffset === 0) loadLogs(false);
+            }
+        }
+
+        function loadLogs(append) {
+            fetch(`/api/logs?limit=${LOGS_PER_PAGE}&offset=${logsOffset}`)
+                .then(r => r.json())
+                .then(data => {
+                    const list = document.getElementById('logs-list');
+                    if (!append) {
+                        list.innerHTML = '';
+                        list.scrollTop = 0;
+                    }
+                    data.entries.forEach(e => {
+                        const div = document.createElement('div');
+                        div.className = `log-entry ${e.level}`;
+                        div.textContent = e.text;
+                        list.appendChild(div);
+                    });
+                    if (!append) list.scrollTop = list.scrollHeight;
+                    const shown = Math.min(logsOffset + LOGS_PER_PAGE, data.total);
+                    document.getElementById('logs-meta').textContent = `${shown} / ${data.total} entries`;
+                    const moreBtn = document.getElementById('logs-more-btn');
+                    moreBtn.style.display = shown < data.total ? 'inline-block' : 'none';
+                })
+                .catch(() => {
+                    document.getElementById('logs-meta').textContent = 'Failed to load logs';
+                });
+        }
+
+        function loadMoreLogs() {
+            logsOffset += LOGS_PER_PAGE;
+            loadLogs(true);
+        }
+
         function updateVehicleUI() {
             fetch('/api/vehicle').then(r => r.json()).then(v => {
                 if (v.profile) {
                     vehicle = v.profile;
                     document.getElementById('vehicle-vin').textContent = v.vin || '--';
-                    document.getElementById('vehicle-redline').textContent = `${vehicle.max_rpm || 8000} / ${vehicle.redline_rpm || 6500}`;
-                    document.getElementById('vehicle-maxspeed').textContent = `${vehicle.max_speed || 200} km/h`;
+                    const make = v.profile.make || '';
+                    const model = v.profile.model || '';
+                    const year = v.profile.year || '';
+                    document.getElementById('vehicle-model').textContent =
+                        [make, model, year].filter(Boolean).join(' ') || 'Unknown';
+                    document.getElementById('vehicle-redline').textContent = `${vehicle.max_rpm || 8000} / ${vehicle.redline_rpm || 6500} RPM`;
+                    document.getElementById('vehicle-maxspeed').textContent =
+                        `${vehicle.max_speed || 200} km/h / ${Math.round((vehicle.max_speed || 200) * 0.621)} mph`;
                 }
                 if (v.stats) {
                     const stats = v.stats;
