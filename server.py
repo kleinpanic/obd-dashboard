@@ -1191,6 +1191,20 @@ DASHBOARD_HTML = '''
 
         .logo { font-weight: 700; font-size: 14px; }
 
+        .ascii-logo {
+            font-family: 'Courier New', monospace;
+            font-size: 6px;
+            line-height: 1;
+            color: var(--accent);
+            white-space: pre;
+            margin-bottom: 16px;
+            text-align: center;
+        }
+
+        @media (min-width: 400px) {
+            .ascii-logo { font-size: 7px; }
+        }
+
         .status {
             display: flex;
             align-items: center;
@@ -1817,6 +1831,22 @@ DASHBOARD_HTML = '''
 <body data-theme="dark">
     <!-- Connection overlay -->
     <div class="connection-overlay" id="connection-overlay">
+        <pre class="ascii-logo">
+   ____  _____ ____   ____
+  / __ \\|___  |  _ \\ / __ \\
+ | |  | |  / /| |_) | |  | |
+ | |  | | / / |  _ &lt;| |  | |
+ | |__| |/ /__| |_) | |__| |
+  \\____/_____/|____/ \\___\\_\\
+
+       [====&gt;   0 0
+     __|_____|__|__
+    /              \\
+   /  OBD COMMANDER \\
+  /__________________\\
+       |   ||   |
+       |___||___|
+        </pre>
         <div class="spinner"></div>
         <div class="connection-text" id="connection-text">Initializing...</div>
         <div class="progress-bar">

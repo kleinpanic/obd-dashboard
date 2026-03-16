@@ -1,29 +1,49 @@
-# OBD Commander
 
-![Dashboard](screenshots/dashboard-mobile.png)
+   ____  _____ ____   ____
+  / __ \|___  |  _ \ / __ \
+ | |  | |  / /| |_) | |  | |
+ | |  | | / / |  _ <| |  | |
+ | |__| |/ /__| |_) | |__| |
+  \____/_____/|____/ \___\_\
 
-Professional car computer system with CLI, WebSocket server, and web dashboard. Works with any OBD-II vehicle (1996+).
+       [====>   0 0
+     __|_____|__|__
+    /              \
+   /  OBD COMMANDER \
+  /__________________\
+       |   ||   |
+
+---
+
+![Dashboard](docs/attachments/dashboard-mobile.png)
+
+**Professional car computer system** with CLI, WebSocket server, and mobile-first web dashboard. Works with any OBD-II vehicle (1996+).
+
+**Fully offline** — no cloud, no external APIs, no network required.
+
+[![Build and Test](https://github.com/kleinpanic/obd-dashboard/actions/workflows/build.yml/badge.svg)](https://github.com/kleinpanic/obd-dashboard/actions/workflows/build.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 ## Features
 
-- **Real-time monitoring**: Live gauges for RPM, speed, and key metrics
-- **WebSocket server**: Real-time push updates at 4Hz
-- **SQLite logging**: Historical data with session tracking
-- **Mobile-first UI**: Dark/light themes, metric/imperial units
-- **DTC support**: View and clear diagnostic trouble codes
-- **CLI interface**: Headless mode, data export, system control
-- **MCP server**: Model Context Protocol for AI integration
-- **Session tracking**: Each drive is a unique session
+- **Real-time monitoring** — Live gauges for RPM, speed, engine load
+- **WebSocket server** — 4Hz push updates to browser
+- **SQLite logging** — Full session history, offline-capable
+- **Mobile-first UI** — Dark/light themes, metric/imperial units
+- **DTC diagnostics** — View and clear trouble codes
+- **Multi-vehicle support** — Auto VIN decode, per-vehicle profiles
+- **CLI interface** — Headless mode, data export, system control
+- **MCP server** — AI assistant integration
 
 ## Screenshots
 
 ### Mobile
 | Dashboard | Sensors | History | Config |
 |-----------|---------|---------|--------|
-| ![Dashboard](screenshots/dashboard-mobile.png) | ![Sensors](screenshots/sensors-mobile.png) | ![History](screenshots/history-mobile.png) | ![Config](screenshots/config-mobile.png) |
+| ![Dashboard](docs/attachments/dashboard-mobile.png) | ![Sensors](docs/attachments/sensors-mobile.png) | ![History](docs/attachments/history-mobile.png) | ![Config](docs/attachments/config-mobile.png) |
 
 ### Desktop
-![Desktop Dashboard](screenshots/dashboard-desktop.png)
+![Desktop Dashboard](docs/attachments/dashboard-desktop.png)
 
 ## Quick Start
 
@@ -32,16 +52,51 @@ Professional car computer system with CLI, WebSocket server, and web dashboard. 
 git clone https://github.com/kleinpanic/obd-dashboard.git
 cd obd-dashboard
 
-# Setup
-python3 -m venv venv
+# Install system dependencies (Linux)
+make install-deps
+
+# Setup Python environment
+make venv
 source venv/bin/activate
-pip install -r requirements.txt
 
 # Run
 ./obdc server start
 
 # Open http://localhost:9000
 ```
+
+## Requirements
+
+### System Dependencies
+
+| Dependency | Purpose | Install |
+|------------|---------|---------|
+| Python 3.9+ | Runtime | `apt install python3 python3-pip python3-venv` |
+| libusb-1.0 | USB serial | `apt install libusb-1.0-0` |
+| dialout group | USB access | `sudo usermod -aG dialout $USER` |
+
+### Python Dependencies
+
+| Package | Purpose |
+|---------|---------|
+| `obd` | ELM327 OBD-II communication |
+| `fastapi` | REST + WebSocket server |
+| `uvicorn[standard]` | ASGI server |
+| `websockets` | WebSocket protocol |
+
+Full list in `requirements.txt`.
+
+## Supported Architectures
+
+| Architecture | Platform | Status |
+|-------------|----------|--------|
+| x86_64 | Linux desktop/server | ✅ Primary |
+| aarch64 | Raspberry Pi 4/5 (64-bit) | ✅ Tested |
+| armv7l | Raspberry Pi 3/Zero 2 (32-bit) | ✅ Supported |
+
+**Raspberry Pi 4/5 is the recommended platform for in-car use.**
+
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for details.
 
 ## CLI Commands
 
@@ -82,106 +137,91 @@ pip install -r requirements.txt
 ./obdc log follow              # Follow live logs
 ```
 
-## Headless Mode
-
-Run without web UI for data logging only:
-
-```bash
-./obdc server headless --interval 1 --log /var/log/obdc.log
-```
-
-Outputs JSON lines to stdout for piping:
-
-```bash
-./obdc live --interval 0.5 | jq '.sensors.RPM'
-```
-
 ## API Endpoints
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/` | GET | Web dashboard |
 | `/api/status` | GET | Connection status |
-| `/api/sensors` | GET | All sensor readings |
-| `/api/sensors/{name}` | GET | Single sensor with history |
-| `/api/history/{sensor}` | GET | Historical data (5min default) |
+| `/api/sensors` | GET | All sensor readings (cached) |
+| `/api/history/{sensor}` | GET | Historical data |
 | `/api/dtc` | GET | Diagnostic trouble codes |
 | `/api/dtc/clear` | POST | Clear all DTCs |
 | `/api/sessions` | GET | List driving sessions |
+| `/api/vehicle` | GET | Current vehicle profile |
+| `/api/profiles` | GET | All stored vehicle profiles |
 | `/api/config` | GET/POST | UI configuration |
-| `/ws` | WebSocket | Real-time updates |
+| `/api/logs` | GET | Structured logs |
+| `/ws` | WebSocket | Real-time updates at 4Hz |
+
+## Offline Operation
+
+**OBD Commander works without any network connection.**
+
+- SQLite database for all logging
+- Embedded VIN decode table (no NHTSA API)
+- No external JavaScript libraries
+- No CDN dependencies
+- WebSocket runs on localhost
+
+## Installation Options
+
+### User-Local (No sudo)
+```bash
+make install-user
+obdc server start
+```
+
+### System-Wide
+```bash
+sudo make install
+obdc server start
+```
+
+### systemd Service (Auto-start)
+```bash
+sudo make install-service
+sudo systemctl enable --now obdc
+```
 
 ## MCP Server
 
 Model Context Protocol server for AI assistant integration:
 
 ```bash
-# Start MCP server
 ./obdc mcp start
-
-# MCP tools available:
-# - obdc_get_status
-# - obdc_get_sensors
-# - obdc_get_sensor_history
-# - obdc_get_dtc
-# - obdc_stream_live
 ```
 
-Configure in your MCP client:
-```json
-{
-  "mcpServers": {
-    "obdc": {
-      "command": "/path/to/obdc",
-      "args": ["mcp", "start"]
-    }
-  }
-}
-```
+Tools: `obdc_get_status`, `obdc_get_sensors`, `obdc_get_sensor_history`, `obdc_get_dtc`, `obdc_stream_live`
 
-## Systemd Service (RPi4)
+## Security Audit
 
 ```bash
-# Install
-mkdir -p ~/.config/systemd/user
-cp obdc.service ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now obdc
-
-# Access at http://localhost:9000
+make audit
 ```
 
-## Requirements
+Checks for:
+- Hardcoded secrets
+- .env in git
+- Missing .gitignore entries
+- External HTTP calls
 
-- Python 3.8+
-- ELM327 OBD adapter (USB recommended)
-- Works on Linux, macOS, Windows
+## Documentation
+
+- [INSTALL.md](docs/INSTALL.md) — Full installation guide
+- [ARCHITECTURE.md](docs/ARCHITECTURE.md) — Platform support, offline, performance
 
 ## Tested Vehicles
 
-- 2021 Subaru Crosstrek
+- 2021 Subaru Crosstrek (FB20 2.0L)
 - Any OBD-II compliant vehicle (1996+)
-
-## Architecture
-
-```
-┌─────────────────────────────────────────┐
-│        FastAPI + WebSocket Server       │
-│         (uvicorn, ~50MB RAM)            │
-├─────────────────────────────────────────┤
-│  CLI (obdc) - Full system control       │
-│  - Server management                    │
-│  - Database operations                  │
-│  - Headless logging                     │
-│  - MCP server                           │
-├─────────────────────────────────────────┤
-│  SQLite (~/.local/share/obdc/obdc.db)   │
-│  - Sessions with unique IDs             │
-│  - Time-series sensor data              │
-│  - DTC history                          │
-└─────────────────────────────────────────┘
-```
 
 ## License
 
-MIT
+MIT License — see [LICENSE](LICENSE) file.
+
+Free and Open Source Software (FOSS).
+
+---
+
+**GitHub:** https://github.com/kleinpanic/obd-dashboard

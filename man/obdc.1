@@ -1,0 +1,185 @@
+.TH OBDC 1 "2026-03-15" "1.0.0" "OBD Commander Manual"
+.SH NAME
+obdc \- OBD-II car computer dashboard and CLI
+.SH SYNOPSIS
+.B obdc
+\fICOMMAND\fR [\fISUBCOMMAND\fR] [\fIOPTIONS\fR]
+.SH DESCRIPTION
+.B obdc
+is a professional OBD-II car computer system for Linux (including Raspberry Pi 4/ARM).
+It provides a real-time WebSocket server, mobile-first web dashboard, SQLite logging,
+DTC diagnostics, session tracking, and a JSON-first CLI.
+Works with any OBD-II compliant vehicle (1996+) via ELM327-based USB adapters.
+Operates fully offline — no network or cloud connection required.
+.SH COMMANDS
+.SS Server Management
+.TP
+.B obdc server start [\fIPORT\fR]
+Start the web server and OBD listener. Default port: 9000.
+.TP
+.B obdc server stop
+Stop the running server.
+.TP
+.B obdc server restart [\fIPORT\fR]
+Restart the server.
+.TP
+.B obdc server status
+Print server running state and PID as JSON.
+.TP
+.B obdc server headless
+Start in daemon mode without opening the dashboard.
+.SS OBD Queries
+.TP
+.B obdc status
+Show OBD connection status, VIN, session ID, and live sensor count as JSON.
+.TP
+.B obdc scan
+List all supported sensors and their current values.
+.TP
+.B obdc read \fISENSOR\fR
+Read a single sensor by name (e.g.\& RPM, SPEED, THROTTLE_POS).
+.TP
+.B obdc dtc
+List active Diagnostic Trouble Codes (DTCs).
+.TP
+.B obdc dtc clear
+Clear all DTCs (confirmation required).
+.TP
+.B obdc vin
+Print the vehicle VIN decoded over OBD-II Mode 09.
+.SS Data Export
+.TP
+.B obdc export [\fIFILE\fR]
+Export session data to CSV.
+.TP
+.B obdc db stats
+Print database statistics (row counts, disk usage).
+.TP
+.B obdc db clean
+Remove sensor data older than 30 days.
+.SH OPTIONS
+.TP
+.B \-\-json
+Force JSON output (most commands default to JSON already).
+.TP
+.B \-\-port \fIPORT\fR
+Override default port (9000).
+.TP
+.B \-\-device \fIDEVICE\fR
+Override OBD device path (default: auto-detected from /dev/ttyUSB*).
+.TP
+.B \-h, \-\-help
+Show help and exit.
+.TP
+.B \-\-version
+Print version and exit.
+.SH FILES
+.TP
+.I ~/.local/share/obdc/obdc.db
+SQLite database: sensor_data, sessions, vehicle_profiles, vehicle_stats tables.
+.TP
+.I ~/.local/share/obdc/config.json
+Runtime configuration: theme, units, refresh_rate.
+.TP
+.I ~/.local/share/obdc/obdc.log
+Structured application log (INFO/WARNING/ERROR).
+.TP
+.I ~/.local/share/obdc/server.pid
+PID file written by the server process.
+.TP
+.I /etc/systemd/system/obdc.service
+Optional systemd service file for auto-start on boot.
+.SH ENVIRONMENT
+.TP
+.B OBDC_PORT
+Override default server port (9000).
+.TP
+.B OBDC_DEVICE
+Override OBD device path.
+.TP
+.B OBDC_DB
+Override SQLite database path.
+.SH ARCHITECTURE
+.B obdc
+is written in pure Python and runs on any architecture supported by Python 3.9+.
+Tested architectures:
+.IP \[bu] 2
+x86_64 (amd64) — primary development platform
+.IP \[bu]
+aarch64 (ARM64) — Raspberry Pi 4, Pi 5, Apple Silicon VMs
+.IP \[bu]
+armv7l (armhf) — Raspberry Pi 3/Zero 2 (32-bit)
+.PP
+For Raspberry Pi 4 (aarch64):
+Use \fBpip3 install -r requirements.txt\fR inside a venv.
+The \fBobd\fR Python package includes pre-built ELM327 drivers for ARM.
+.SH EXAMPLES
+.PP
+Start the dashboard on default port:
+.RS
+.B obdc server start
+.RE
+.PP
+Start on a custom port and open in a browser:
+.RS
+.B obdc server start 8888 && xdg-open http://localhost:8888
+.RE
+.PP
+Query current RPM:
+.RS
+.B obdc read RPM
+.RE
+.PP
+Export the last session to CSV:
+.RS
+.B obdc export ~/drive-$(date +%Y%m%d).csv
+.RE
+.PP
+Check for trouble codes:
+.RS
+.B obdc dtc
+.RE
+.SH OBD DEVICE SETUP
+Connect an ELM327 USB adapter to the vehicle OBD-II port and to the host USB port.
+.PP
+Add the current user to the \fBdialout\fR group:
+.RS
+.B sudo usermod -aG dialout $USER
+.RE
+.PP
+Verify the device appears:
+.RS
+.B ls /dev/ttyUSB*
+.RE
+.PP
+The server auto-detects the device at startup. Use \fB\-\-device\fR to override.
+.SH OFFLINE OPERATION
+.B obdc
+is fully offline-capable by design. All data is stored locally in SQLite.
+The web dashboard uses no external CDN, JavaScript framework, or cloud service.
+VIN decoding uses an embedded lookup table (no network required).
+OBD-II communication is local USB serial — no WiFi needed.
+.SH DIAGNOSTICS
+View structured logs:
+.RS
+.B tail -f ~/.local/share/obdc/obdc.log
+.RE
+.PP
+Check server status:
+.RS
+.B obdc server status
+.RE
+.SH BUGS
+Report bugs at: https://github.com/kleinpanic/obd-dashboard/issues
+.PP
+.B COOLANT_TEMP (PID 0x05)
+is not available on some vehicles (e.g. 2021 Subaru Crosstrek) which use
+proprietary protocols for coolant temperature. Use OIL_TEMP and AMBIANT_AIR_TEMP instead.
+.SH LICENSE
+MIT License. See LICENSE file in the source distribution.
+.SH SEE ALSO
+.BR python3 (1),
+.BR sqlite3 (1),
+.BR systemctl (1)
+.SH AUTHOR
+kleinpanic <https://github.com/kleinpanic>
