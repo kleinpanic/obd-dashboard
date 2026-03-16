@@ -1866,14 +1866,11 @@ DASHBOARD_HTML = '''
     <!-- Connection overlay -->
     <div class="connection-overlay" id="connection-overlay">
         <pre class="ascii-logo">
- ____  ____  ____  ____
-|    ||    ||    ||    |
-|:;;:||:;;:||:;;:||:;;:|
-|    ||    ||    ||    |
-|::::||::::||::::||::::|
-|____||____||____||____|
-
-   OBD COMMANDER
+ ___   ____   ____   ____
+/ _ \ |  _ \ |  _ \ / ___|
+| | | || |_) || |_) || |
+| |_| ||  __/ |  __/ | |___
+\___/ |_|    |_|     \____|
         </pre>
         <div class="spinner"></div>
         <div class="connection-text" id="connection-text">Initializing...</div>
