@@ -1,11 +1,14 @@
 
-  ____  ____  ____  ____
- / __ \/ __ \/ __ \/ __ \
-| |  | |  | | |  | |  | |
-| |__| |__| | |__| |__| |
- \____\____\____\____\___\
+ ____  ____  ____  ____
+|    ||    ||    ||    |
+|:;;:||:;;:||:;;:||:;;:|
+|    ||    ||    ||    |
+|::::||::::||::::||::::|
+|::::||::::||::::||::::|
+|____||____||____||____|
 
-    O B D   C O M M A N D E R
+OBD COMMANDER
+=============
 
 ---
 
@@ -84,9 +87,9 @@ Full list in `requirements.txt`.
 
 | Architecture | Platform | Status |
 |-------------|----------|--------|
-| x86_64 | Linux desktop/server | ✅ Primary |
-| aarch64 | Raspberry Pi 4/5 (64-bit) | ✅ Tested |
-| armv7l | Raspberry Pi 3/Zero 2 (32-bit) | ✅ Supported |
+| x86_64 | Linux desktop/server | Primary |
+| aarch64 | Raspberry Pi 4/5 (64-bit) | Tested |
+| armv7l | Raspberry Pi 3/Zero 2 (32-bit) | Supported |
 
 **Raspberry Pi 4/5 is the recommended platform for in-car use.**
 
@@ -125,19 +128,13 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for details.
 ./obdc db sessions             # List all driving sessions
 ```
 
-### Logs
-```bash
-./obdc log tail 50             # Last 50 log lines
-./obdc log follow              # Follow live logs
-```
-
 ## API Endpoints
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/` | GET | Web dashboard |
 | `/api/status` | GET | Connection status |
-| `/api/sensors` | GET | All sensor readings (cached) |
+| `/api/sensors` | GET | All sensor readings |
 | `/api/history/{sensor}` | GET | Historical data |
 | `/api/dtc` | GET | Diagnostic trouble codes |
 | `/api/dtc/clear` | POST | Clear all DTCs |
@@ -204,6 +201,7 @@ Checks for:
 
 - [INSTALL.md](docs/INSTALL.md) — Full installation guide
 - [ARCHITECTURE.md](docs/ARCHITECTURE.md) — Platform support, offline, performance
+- [TODO.md](TODO.md) — Roadmap and planned features
 
 ## Tested Vehicles
 
