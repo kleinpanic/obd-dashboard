@@ -602,6 +602,7 @@ class OBDManager:
         if not self.connected:
             return {}
         data = {}
+        null_count = 0
         with self.lock:
             for cmd in self.supported:
                 try:
@@ -612,11 +613,14 @@ class OBDManager:
                         if value is not None:
                             unit = str(val.units) if hasattr(val, 'units') else ""
                             data[cmd.name] = {"value": value, "unit": unit}
+                    else:
+                        null_count += 1
                 except:
-                    pass
+                    null_count += 1
         # Cache all sensors for API endpoint
         if data:
             self.all_sensors_data = data
+        logger.debug(f"read_all: {len(data)} sensors with data, {null_count} null (of {len(self.supported)} supported)")
         return data
 
     def get_vin(self):
