@@ -102,8 +102,20 @@ install-service: install
 install-service-user: install-user
 	@echo "Installing user systemd service..."
 	@mkdir -p ~/.config/systemd/user
-	@sed "s|ExecStart=.*|ExecStart=$(USER_BINDIR)/obdc server start|g" obdc.service \
-	    > ~/.config/systemd/user/obdc.service
+	@echo "[Unit]" > ~/.config/systemd/user/obdc.service
+	@echo "Description=OBD Commander Car Computer" >> ~/.config/systemd/user/obdc.service
+	@echo "After=network.target" >> ~/.config/systemd/user/obdc.service
+	@echo "" >> ~/.config/systemd/user/obdc.service
+	@echo "[Service]" >> ~/.config/systemd/user/obdc.service
+	@echo "Type=simple" >> ~/.config/systemd/user/obdc.service
+	@echo "WorkingDirectory=$(PWD)" >> ~/.config/systemd/user/obdc.service
+	@echo "Environment=PATH=$(PWD)/venv/bin:$(PATH)" >> ~/.config/systemd/user/obdc.service
+	@echo "ExecStart=$(PWD)/venv/bin/python server.py --host 0.0.0.0 --port 9000" >> ~/.config/systemd/user/obdc.service
+	@echo "Restart=on-failure" >> ~/.config/systemd/user/obdc.service
+	@echo "RestartSec=5" >> ~/.config/systemd/user/obdc.service
+	@echo "" >> ~/.config/systemd/user/obdc.service
+	@echo "[Install]" >> ~/.config/systemd/user/obdc.service
+	@echo "WantedBy=default.target" >> ~/.config/systemd/user/obdc.service
 	systemctl --user daemon-reload
 	@echo ""
 	@echo "Enable with: systemctl --user enable --now obdc"
