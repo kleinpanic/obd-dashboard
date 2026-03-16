@@ -1867,10 +1867,10 @@ DASHBOARD_HTML = '''
     <div class="connection-overlay" id="connection-overlay">
         <pre class="ascii-logo">
  ___   ____   ____   ____
-/ _ \ |  _ \ |  _ \ / ___|
+/ _ \\ |  _ \\ |  _ \\ / ___|
 | | | || |_) || |_) || |
 | |_| ||  __/ |  __/ | |___
-\___/ |_|    |_|     \____|
+\\___/ |_|    |_|     \\____|
         </pre>
         <div class="spinner"></div>
         <div class="connection-text" id="connection-text">Initializing...</div>
