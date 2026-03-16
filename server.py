@@ -487,6 +487,7 @@ class OBDManager:
         self.lock = threading.Lock()
         self.last_data = {}
         self.last_sensor_data = {}
+        self.all_sensors_data = {}
         self.dtc_codes = []
 
     def connect(self):
@@ -613,6 +614,27 @@ class OBDManager:
                             data[cmd.name] = {"value": value, "unit": unit}
                 except:
                     pass
+        # Cache all sensors for API endpoint
+        if data:
+            self.all_sensors_data = data
+        return data
+
+    def get_vin(self):
+        if not self.connected:
+            return {}
+        data = {}
+        with self.lock:
+            for cmd in self.supported:
+                try:
+                    resp = self.connection.query(cmd)
+                    if not resp.is_null():
+                        val = resp.value
+                        value = float(val.magnitude) if hasattr(val, 'magnitude') and isinstance(val.magnitude, (int, float)) else None
+                        if value is not None:
+                            unit = str(val.units) if hasattr(val, 'units') else ""
+                            data[cmd.name] = {"value": value, "unit": unit}
+                except:
+                    pass
         return data
 
     def get_vin(self):
@@ -676,6 +698,7 @@ async def obd_reader():
     global engine_on, engine_off_since
     consecutive_failures = 0
     connection_step = 0
+    full_sensor_counter = 0
 
     while True:
         if obd_manager.connected and ws_manager.active_connections:
@@ -713,6 +736,14 @@ async def obd_reader():
                         "session_stats": session_stats
                     })
                     consecutive_failures = 0
+                    
+                    # --- Periodic full sensor query (every 10 iterations = ~2.5s) ---
+                    full_sensor_counter += 1
+                    if full_sensor_counter >= 10:
+                        full_sensor_counter = 0
+                        # Run in thread pool to not block event loop
+                        loop = asyncio.get_event_loop()
+                        await loop.run_in_executor(None, obd_manager.read_all)
                 else:
                     consecutive_failures += 1
                     if consecutive_failures > 5:
@@ -956,11 +987,10 @@ async def delete_profile(vin: str):
 
 @app.get("/api/sensors")
 async def sensors():
-    # Return cached data - avoids blocking the event loop with 122 synchronous OBD queries.
-    # last_sensor_data is kept fresh by the WS reader loop at 4Hz.
-    # Falls back to last_data which accumulates across all queries.
-    if obd_manager.last_sensor_data:
-        return obd_manager.last_sensor_data
+    # Return all cached sensors (populated by periodic background query)
+    # Falls back to last_data if all_sensors_data is empty
+    if obd_manager.all_sensors_data:
+        return obd_manager.all_sensors_data
     return obd_manager.last_data
 
 @app.get("/api/history/{sensor}")
@@ -1832,20 +1862,13 @@ DASHBOARD_HTML = '''
     <!-- Connection overlay -->
     <div class="connection-overlay" id="connection-overlay">
         <pre class="ascii-logo">
-   ____  _____ ____   ____
-  / __ \\|___  |  _ \\ / __ \\
- | |  | |  / /| |_) | |  | |
- | |  | | / / |  _ &lt;| |  | |
- | |__| |/ /__| |_) | |__| |
-  \\____/_____/|____/ \\___\\_\\
+  ____  ____  ____  ____
+ / __ \\/ __ \\/ __ \\/ __ \\
+| |  | |  | | |  | |  | |
+| |__| |__| | |__| |__| |
+ \\____\\____\\____\\____\\___\\
 
-       [====&gt;   0 0
-     __|_____|__|__
-    /              \\
-   /  OBD COMMANDER \\
-  /__________________\\
-       |   ||   |
-       |___||___|
+    O B D   C O M M A N D E R
         </pre>
         <div class="spinner"></div>
         <div class="connection-text" id="connection-text">Initializing...</div>
