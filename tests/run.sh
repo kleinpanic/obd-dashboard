@@ -228,7 +228,7 @@ echo -n "README.md exists... "
 [ -f "$ROOT_DIR/README.md" ] && pass "README.md exists" || fail "README" "README.md missing"
 
 echo -n "README has screenshot tables... "
-grep -q "screenshots/" "$ROOT_DIR/README.md" && pass "README references screenshots" || fail "README" "no screenshot references"
+grep -qE "screenshots/|docs/attachments/" "$ROOT_DIR/README.md" && pass "README references screenshots" || fail "README" "no screenshot references"
 
 echo -n "requirements.txt exists... "
 [ -f "$ROOT_DIR/requirements.txt" ] && pass "requirements.txt exists" || fail "Requirements" "requirements.txt missing"
@@ -247,8 +247,11 @@ for img in dashboard-mobile sensors-mobile history-mobile config-mobile dashboar
     if [ -f "$ROOT_DIR/screenshots/${img}.png" ]; then
         SIZE=$(wc -c < "$ROOT_DIR/screenshots/${img}.png")
         [ "$SIZE" -gt 1000 ] && pass "Screenshot exists (${SIZE} bytes)" || fail "Screenshot" "${img}.png is suspiciously small"
+    elif [ -f "$ROOT_DIR/docs/attachments/${img}.png" ]; then
+        SIZE=$(wc -c < "$ROOT_DIR/docs/attachments/${img}.png")
+        [ "$SIZE" -gt 1000 ] && pass "Screenshot exists (${SIZE} bytes)" || fail "Screenshot" "${img}.png is suspiciously small"
     else
-        fail "Screenshot" "${img}.png missing"
+        fail "Screenshot" "${img}.png missing (checked screenshots/ and docs/attachments/)"
     fi
 done
 
