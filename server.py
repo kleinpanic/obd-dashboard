@@ -170,21 +170,32 @@ init_db()
 # → (make, model, redline_rpm, max_rpm, max_speed_kmh)
 # max_speed = speedometer dial max, not ECU limiter
 _VIN_SPECS = {
-    # Subaru Crosstrek (JF2GT) - 2.0L FB20 (engine code C)
-    ("JF2GT", "C"): ("Subaru", "Crosstrek 2.0L", 6000, 7000, 240),
+    # Format: (wmi5, engine_pos8): (make, model, redline_rpm, max_rpm, max_speed_kmh)
+    # redline_rpm = where red zone starts; max_rpm = gauge arc end (tachometer max)
+
+    # Subaru Crosstrek (JF2GT) — 2.0L FB20 (engine code C)
+    # Tachometer: 8k max, red zone starts at 6k
+    ("JF2GT", "C"): ("Subaru", "Crosstrek 2.0L", 6000, 8000, 240),
     # Subaru Crosstrek 2.5L (engine code N, 2024+)
-    ("JF2GT", "N"): ("Subaru", "Crosstrek 2.5L", 6400, 7500, 240),
-    # Subaru WRX / WRX STI
-    ("JF1VA", "H"): ("Subaru", "WRX 2.0T", 6800, 8000, 260),
-    ("JF1GR", "X"): ("Subaru", "WRX STI 2.5T", 7200, 8500, 280),
+    ("JF2GT", "N"): ("Subaru", "Crosstrek 2.5L", 6400, 8000, 240),
+    # Subaru WRX 2.0T
+    ("JF1VA", "H"): ("Subaru", "WRX 2.0T", 6800, 9000, 260),
+    # Subaru WRX STI 2.5T
+    ("JF1GR", "X"): ("Subaru", "WRX STI 2.5T", 7200, 9000, 280),
     # Subaru Outback / Legacy 2.5L
     ("4S4BT", "A"): ("Subaru", "Outback 2.5L", 6500, 7500, 220),
-    # Toyota Corolla
+    # Toyota Corolla 1.8L
     ("JTDBU", "U"): ("Toyota", "Corolla 1.8L", 6400, 7500, 200),
-    # Honda Civic
-    ("2HGF", "R"): ("Honda", "Civic 1.5T", 6200, 7000, 220),
+    # Honda Civic 1.5T
+    ("2HGF", "R"): ("Honda", "Civic 1.5T", 6200, 7500, 220),
+    # Honda Civic (alt WMI)
+    ("19XF", "R"): ("Honda", "Civic 1.5T", 6200, 7500, 220),
     # Ford F-150 5.0L
     ("1FTEW", "F"): ("Ford", "F-150 5.0L", 6500, 7000, 200),
+    # Mazda 3
+    ("JM1BN", "P"): ("Mazda", "3 2.5L", 6500, 7500, 220),
+    # Volkswagen GTI / Golf 2.0T
+    ("WVWGJ", "H"): ("Volkswagen", "GTI 2.0T", 6500, 7000, 250),
 }
 
 _MODEL_YEAR = {
@@ -875,6 +886,74 @@ async def update_vehicle(data: dict):
 
     return vehicle_profile
 
+
+@app.get("/api/profiles")
+async def list_profiles():
+    """List all stored vehicle profiles."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        SELECT vp.vin, vp.make, vp.model, vp.year,
+               vp.max_rpm, vp.redline_rpm, vp.max_speed,
+               vp.normal_temp_min, vp.normal_temp_max,
+               vp.warning_temp, vp.low_fuel_warning, vp.low_fuel_danger,
+               vp.created_at,
+               COALESCE(vs.total_sessions, 0) as total_sessions,
+               COALESCE(vs.max_rpm_ever, 0) as max_rpm_ever,
+               COALESCE(vs.max_speed_ever, 0) as max_speed_ever,
+               COALESCE(vs.last_session, 0) as last_session
+        FROM vehicle_profiles vp
+        LEFT JOIN vehicle_stats vs ON vp.vin = vs.vin
+        ORDER BY vs.last_session DESC NULLS LAST
+    """)
+    rows = c.fetchall()
+    conn.close()
+
+    profiles = []
+    for row in rows:
+        vin = row[0]
+        decoded = decode_vin(vin)
+        profiles.append({
+            "vin": vin,
+            "make": row[1] or decoded.get("make"),
+            "model": row[2] or decoded.get("model"),
+            "year": row[3] or decoded.get("year"),
+            "max_rpm": row[4],
+            "redline_rpm": row[5],
+            "max_speed": row[6],
+            "normal_temp_min": row[7],
+            "normal_temp_max": row[8],
+            "warning_temp": row[9],
+            "low_fuel_warning": row[10],
+            "low_fuel_danger": row[11],
+            "created_at": row[12],
+            "total_sessions": row[13],
+            "max_rpm_ever": row[14],
+            "max_speed_ever": row[15],
+            "last_session": row[16],
+            "is_active": vin == current_vin,
+            "decoded": decoded,
+        })
+    return {"profiles": profiles, "count": len(profiles)}
+
+
+@app.delete("/api/profiles/{vin}")
+async def delete_profile(vin: str):
+    """Delete a vehicle profile (and its stats). Cannot delete the currently active VIN."""
+    if vin == current_vin:
+        return {"error": "Cannot delete the currently active vehicle profile"}
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("DELETE FROM vehicle_stats WHERE vin = ?", (vin,))
+    c.execute("DELETE FROM vehicle_profiles WHERE vin = ?", (vin,))
+    deleted = c.rowcount
+    conn.commit()
+    conn.close()
+    if deleted:
+        logger.info(f"PROFILE DELETED vin={vin}")
+        return {"status": "deleted", "vin": vin}
+    return {"error": "Profile not found"}
+
 @app.get("/api/sensors")
 async def sensors():
     # Return cached data - avoids blocking the event loop with 122 synchronous OBD queries.
@@ -1355,6 +1434,90 @@ DASHBOARD_HTML = '''
             cursor: pointer;
         }
         .logs-load-btn:hover { background: var(--muted); }
+
+        /* Profiles section */
+        .profile-card {
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            margin: 8px;
+            overflow: hidden;
+            transition: border-color 0.2s;
+        }
+        .profile-card.active-profile {
+            border-color: var(--accent);
+        }
+        .profile-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 10px 12px;
+            cursor: pointer;
+            background: var(--bg);
+        }
+        .profile-header:active { opacity: 0.8; }
+        .profile-title {
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--text);
+        }
+        .profile-subtitle {
+            font-size: 11px;
+            color: var(--muted);
+            margin-top: 2px;
+        }
+        .profile-badge {
+            font-size: 10px;
+            background: var(--accent);
+            color: #000;
+            padding: 2px 7px;
+            border-radius: 10px;
+            font-weight: 700;
+        }
+        .profile-chevron {
+            font-size: 10px;
+            color: var(--muted);
+            margin-left: 8px;
+        }
+        .profile-body {
+            display: none;
+            background: var(--card);
+            border-top: 1px solid var(--border);
+        }
+        .profile-body.expanded { display: block; }
+        .profile-rows { padding: 8px 12px; }
+        .profile-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 5px 0;
+            border-bottom: 1px solid var(--border);
+            font-size: 12px;
+        }
+        .profile-row:last-child { border-bottom: none; }
+        .profile-row-label { color: var(--muted); }
+        .profile-row-val { color: var(--text); font-weight: 500; }
+        .profile-actions {
+            padding: 8px 12px;
+            border-top: 1px solid var(--border);
+            display: flex;
+            justify-content: flex-end;
+        }
+        .profile-delete-btn {
+            background: transparent;
+            border: 1px solid var(--danger);
+            color: var(--danger);
+            padding: 5px 14px;
+            border-radius: 6px;
+            font-size: 12px;
+            cursor: pointer;
+        }
+        .profile-delete-btn:hover { background: var(--danger); color: #fff; }
+        .profile-delete-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+        .profiles-empty {
+            text-align: center;
+            color: var(--muted);
+            font-size: 12px;
+            padding: 20px;
+        }
 
         /* Action buttons */
         .action-buttons {
@@ -1916,6 +2079,14 @@ DASHBOARD_HTML = '''
                         </div>
                     </div>
 
+                    <div class="section-title logs-toggle" onclick="toggleProfiles(this)">
+                        Vehicle Profiles
+                        <span id="profiles-chevron" style="font-size:12px;color:var(--muted);">▶ collapsed</span>
+                    </div>
+                    <div id="profiles-section" style="display:none;margin-bottom:16px;">
+                        <div id="profiles-list"></div>
+                    </div>
+
                     <div class="section-title logs-toggle" onclick="toggleLogs(this)">
                         System Logs
                         <span id="logs-chevron" style="font-size:12px;color:var(--muted);">▶ collapsed</span>
@@ -2312,6 +2483,146 @@ DASHBOARD_HTML = '''
                         <div class="sensor-value">${val.value.toFixed(1)}<span class="sensor-unit">${val.unit}</span></div>
                     </div>
                 `).join('');
+        }
+
+        // ── Vehicle Profiles ─────────────────────────────────────────────────
+        function toggleProfiles(btn) {
+            const section = document.getElementById('profiles-section');
+            const chevron = document.getElementById('profiles-chevron');
+            const visible = section.style.display !== 'none';
+            if (visible) {
+                section.style.display = 'none';
+                chevron.textContent = '▶ collapsed';
+            } else {
+                section.style.display = 'block';
+                chevron.textContent = '▼';
+                loadProfiles();
+            }
+        }
+
+        function loadProfiles() {
+            fetch('/api/profiles')
+                .then(r => r.json())
+                .then(data => {
+                    const container = document.getElementById('profiles-list');
+                    container.innerHTML = '';
+                    if (!data.profiles || data.profiles.length === 0) {
+                        container.innerHTML = '<div class="profiles-empty">No vehicle profiles stored yet.</div>';
+                        return;
+                    }
+                    data.profiles.forEach((p, idx) => renderProfileCard(container, p, idx));
+                })
+                .catch(() => {
+                    document.getElementById('profiles-list').innerHTML =
+                        '<div class="profiles-empty">Failed to load profiles.</div>';
+                });
+        }
+
+        function renderProfileCard(container, p, idx) {
+            const card = document.createElement('div');
+            card.className = 'profile-card' + (p.is_active ? ' active-profile' : '');
+            card.id = `profile-card-${p.vin}`;
+
+            const make = p.make || '?';
+            const model = p.model || '?';
+            const year = p.year || '?';
+            const lastSeen = p.last_session
+                ? new Date(p.last_session * 1000).toLocaleDateString()
+                : 'Never';
+            const speedMph = Math.round((p.max_speed || 200) * 0.621);
+            const maxRpmEverMph = p.max_speed_ever
+                ? Math.round(p.max_speed_ever * 0.621) : 0;
+
+            card.innerHTML = `
+                <div class="profile-header" onclick="toggleProfileCard('${p.vin}')">
+                    <div>
+                        <div class="profile-title">${make} ${model} ${year}
+                            ${p.is_active ? '<span class="profile-badge">ACTIVE</span>' : ''}
+                        </div>
+                        <div class="profile-subtitle">VIN: ${p.vin} · Last seen: ${lastSeen}</div>
+                    </div>
+                    <span class="profile-chevron" id="pchev-${p.vin}">▶</span>
+                </div>
+                <div class="profile-body" id="pbody-${p.vin}">
+                    <div class="profile-rows">
+                        <div class="profile-row">
+                            <span class="profile-row-label">VIN</span>
+                            <span class="profile-row-val" style="font-family:monospace;font-size:11px;">${p.vin}</span>
+                        </div>
+                        <div class="profile-row">
+                            <span class="profile-row-label">Make / Model</span>
+                            <span class="profile-row-val">${make} ${model}</span>
+                        </div>
+                        <div class="profile-row">
+                            <span class="profile-row-label">Model Year</span>
+                            <span class="profile-row-val">${year}</span>
+                        </div>
+                        <div class="profile-row">
+                            <span class="profile-row-label">Engine Code</span>
+                            <span class="profile-row-val" style="font-family:monospace;">${p.vin.length >= 8 ? p.vin[7] : '?'}</span>
+                        </div>
+                        <div class="profile-row">
+                            <span class="profile-row-label">WMI</span>
+                            <span class="profile-row-val" style="font-family:monospace;">${p.vin.substring(0,3)}</span>
+                        </div>
+                        <div class="profile-row">
+                            <span class="profile-row-label">Max RPM (gauge)</span>
+                            <span class="profile-row-val">${p.max_rpm || 8000}</span>
+                        </div>
+                        <div class="profile-row">
+                            <span class="profile-row-label">Redline</span>
+                            <span class="profile-row-val" style="color:var(--danger);">${p.redline_rpm || 6500} RPM</span>
+                        </div>
+                        <div class="profile-row">
+                            <span class="profile-row-label">Max Speed (gauge)</span>
+                            <span class="profile-row-val">${p.max_speed || 200} km/h / ${speedMph} mph</span>
+                        </div>
+                        <div class="profile-row">
+                            <span class="profile-row-label">Total Sessions</span>
+                            <span class="profile-row-val">${p.total_sessions}</span>
+                        </div>
+                        <div class="profile-row">
+                            <span class="profile-row-label">All-Time Max RPM</span>
+                            <span class="profile-row-val">${p.max_rpm_ever || '--'}</span>
+                        </div>
+                        <div class="profile-row">
+                            <span class="profile-row-label">All-Time Max Speed</span>
+                            <span class="profile-row-val">${p.max_speed_ever ? p.max_speed_ever + ' km/h / ' + maxRpmEverMph + ' mph' : '--'}</span>
+                        </div>
+                    </div>
+                    ${!p.is_active ? `
+                    <div class="profile-actions">
+                        <button class="profile-delete-btn" onclick="deleteProfile('${p.vin}', event)">Delete Profile</button>
+                    </div>` : ''}
+                </div>
+            `;
+            container.appendChild(card);
+        }
+
+        function toggleProfileCard(vin) {
+            const body = document.getElementById(`pbody-${vin}`);
+            const chev = document.getElementById(`pchev-${vin}`);
+            const expanded = body.classList.toggle('expanded');
+            chev.textContent = expanded ? '▼' : '▶';
+        }
+
+        function deleteProfile(vin, event) {
+            event.stopPropagation();
+            if (!confirm(`Delete profile for VIN ${vin}?\n\nThis will remove all stored data for this vehicle.`)) return;
+            fetch(`/api/profiles/${vin}`, { method: 'DELETE' })
+                .then(r => r.json())
+                .then(data => {
+                    if (data.status === 'deleted') {
+                        const card = document.getElementById(`profile-card-${vin}`);
+                        if (card) card.remove();
+                        const list = document.getElementById('profiles-list');
+                        if (!list.querySelector('.profile-card')) {
+                            list.innerHTML = '<div class="profiles-empty">No vehicle profiles stored yet.</div>';
+                        }
+                    } else {
+                        alert(data.error || 'Delete failed');
+                    }
+                });
         }
 
         // ── Logs ──────────────────────────────────────────────────────────────
