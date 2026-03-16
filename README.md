@@ -161,13 +161,16 @@ make install-user
 obdc server start
 ```
 
-### System-Wide
+### systemd Service — User Level (No sudo, auto-start after login)
 ```bash
-sudo make install
-obdc server start
+make install-service-user
+systemctl --user enable --now obdc
+
+# For auto-start on boot (before login):
+loginctl enable-linger $USER
 ```
 
-### systemd Service (Auto-start)
+### systemd Service — System-Wide (requires sudo)
 ```bash
 sudo make install-service
 sudo systemctl enable --now obdc

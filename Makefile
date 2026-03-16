@@ -89,14 +89,27 @@ install-user: venv man/obdc.1
 	@echo "Installed to $(USER_BINDIR)/obdc"
 	@echo "Make sure $(USER_BINDIR) is in your PATH"
 
-## install-service — Install systemd service (RPi4 / server use)
+## install-service — Install systemd service system-wide (requires sudo)
 install-service: install
-	@echo "Installing systemd service..."
+	@echo "Installing systemd service (system-wide)..."
 	@sed "s|ExecStart=.*|ExecStart=$(BINDIR)/obdc server start|g" obdc.service \
 	    > /tmp/obdc.service.tmp
 	sudo install -m 644 /tmp/obdc.service.tmp /etc/systemd/system/obdc.service
 	sudo systemctl daemon-reload
 	@echo "Enable with: sudo systemctl enable --now obdc"
+
+## install-service-user — Install user-level systemd service (NO sudo)
+install-service-user: install-user
+	@echo "Installing user systemd service..."
+	@mkdir -p ~/.config/systemd/user
+	@sed "s|ExecStart=.*|ExecStart=$(USER_BINDIR)/obdc server start|g" obdc.service \
+	    > ~/.config/systemd/user/obdc.service
+	systemctl --user daemon-reload
+	@echo ""
+	@echo "Enable with: systemctl --user enable --now obdc"
+	@echo ""
+	@echo "Note: User services run after login. For auto-start on boot,"
+	@echo "enable lingering: loginctl enable-linger $$USER"
 
 ## man — View the man page locally
 man: man/obdc.1
